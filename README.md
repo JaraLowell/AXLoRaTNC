@@ -21,6 +21,12 @@ Use the browser-based installer — no drivers or tools needed. Works in Chrome 
 | LILYGO T-Beam SUPREME 433MHz | ESP32-S3 | SX1262 | `tbeam_supreme_433` | ⚠ not tested |
 | BQ Station G2 | ESP32-S3 | SX1262 + PA | `station_g2` | ⚠ not tested |
 
+On OLED-equipped devices, the screen sleeps after 60 seconds without successful
+LoRa packet transmission or reception and wakes on the next radio activity.
+This is checked at the existing one-second display refresh interval. Serial/TCP
+polling alone does not keep it awake; radio and host communication continue
+normally while the screen is off.
+
 ### Station G2
 
 Build with `pio run -e station_g2` and flash with `pio run -e station_g2 --target upload`.

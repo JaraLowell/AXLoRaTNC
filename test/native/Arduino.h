@@ -11,6 +11,7 @@
 
 #define HIGH 1
 #define LOW 0
+#define OUTPUT 1
 #define UART_HW_FLOWCTRL_CTS_RTS 1
 #define UART_HW_FLOWCTRL_DISABLE 0
 #define strcasecmp _stricmp
@@ -19,6 +20,8 @@
 inline uint32_t testMillis = 0;
 inline uint32_t millis() { return testMillis; }
 inline void delay(uint32_t ms) { testMillis += ms; }
+inline void pinMode(int, int) {}
+inline void digitalWrite(int, int) {}
 inline long random(long maximum) { return maximum == 0 ? 0 : maximum - 1; }
 
 class TestSerial {

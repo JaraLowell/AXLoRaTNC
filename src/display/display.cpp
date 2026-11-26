@@ -6,6 +6,8 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include "util/log.h"
+#include "util/timer.h"
 
 namespace {
 
@@ -23,6 +25,12 @@ static constexpr uint8_t PAGE_COUNT       = 6;
 static constexpr uint8_t PAGE_DWELL_TICKS = 4;  // calls to update() per page (= 4 s)
 static uint8_t sPage  = 0;
 static uint8_t sTicks = 0;
+static constexpr uint32_t DISPLAY_IDLE_MS = 60000;
+static bool sReady = false;
+static bool sAwake = true;
+static uint32_t sLastActivityMs = 0;
+static uint32_t sLastTxCount = 0;
+static uint32_t sLastRxCount = 0;
 
 // Draw one text row. Right-aligns rhs if provided (non-null), left-aligns lhs.
 void drawRow(uint8_t y, const char* lhs, const char* rhs = nullptr) {
@@ -241,6 +249,7 @@ void drawPageServices(const axlora::display::DisplayInfo& info) {
 namespace axlora::display {
 
 void init() {
+  sReady = false;
   // Power on OLED via Vext switch if the variant has one.
   if constexpr (variant::PIN_OLED_VEXT >= 0) {
     pinMode(variant::PIN_OLED_VEXT, OUTPUT);
@@ -248,7 +257,17 @@ void init() {
     delay(50);
   }
   Wire.begin(variant::PIN_OLED_SDA, variant::PIN_OLED_SCL);
-  if (!u8g2.begin()) return;  // silently skip if display not found
+  if (!u8g2.begin()) {
+    LOG_ERR("OLED initialization failed");
+    return;
+  }
+  sReady = true;
+  sAwake = true;
+  sLastActivityMs = util::nowMs();
+  sLastTxCount = 0;
+  sLastRxCount = 0;
+  sPage = 0;
+  sTicks = 0;
   u8g2.setContrast(220);
 
   // Splash screen
@@ -260,6 +279,23 @@ void init() {
 }
 
 void update(const DisplayInfo& info) {
+  if (!sReady) return;
+  const uint32_t now = util::nowMs();
+  if (info.txCount != sLastTxCount || info.rxCount != sLastRxCount) {
+    sLastTxCount = info.txCount;
+    sLastRxCount = info.rxCount;
+    sLastActivityMs = now;
+    if (!sAwake) {
+      u8g2.setPowerSave(0);
+      sAwake = true;
+    }
+  }
+  if (sAwake && util::elapsed(now, sLastActivityMs, DISPLAY_IDLE_MS)) {
+    u8g2.setPowerSave(1);
+    sAwake = false;
+  }
+  if (!sAwake) return;
+
   // Advance page every PAGE_DWELL_TICKS calls
   if (++sTicks >= PAGE_DWELL_TICKS) {
     sTicks = 0;

@@ -72,6 +72,7 @@ struct DisplayInfo {
 void init();
 
 // Call periodically from the main loop with a fresh DisplayInfo snapshot.
+// Successful radio TX/RX counters keep the display awake; 60 s idle sleeps it.
 void update(const DisplayInfo& info);
 
 }  // namespace axlora::display
