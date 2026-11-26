@@ -25,6 +25,7 @@ struct L2Config {
   uint32_t t3Ms = 30000;
   uint32_t t4Ms = 60000;  // RNR busy-timeout; 0 = disabled
   uint8_t n2 = 5;
+  uint16_t iPollLength = 128;
 };
 
 struct L2Stats {
@@ -55,11 +56,15 @@ struct L2Stats {
 class LinkLayer {
  public:
   using TxCallback = bool (*)(const uint8_t* data, size_t len, void* ctx);
-  using DataCallback = void (*)(const uint8_t* data, size_t len, bool connected, void* ctx);
+  using DataCallback = bool (*)(const uint8_t* data, size_t len, bool connected, void* ctx);
+  using ReadyCallback = bool (*)(void* ctx);
 
-  void begin(const L2Config& config, TxCallback tx, DataCallback data, void* ctx);
+  void begin(const L2Config& config, TxCallback tx, DataCallback data, void* ctx,
+             ReadyCallback ready = nullptr);
   void loop();
-  bool sendUi(const Address& destination, const uint8_t* data, size_t len);
+  bool sendUi(const Address& destination, const uint8_t* data, size_t len,
+              const Address* path = nullptr, uint8_t pathCount = 0, bool poll = false,
+              const Address* source = nullptr);
   bool connectTo(const Address& destination);
   bool disconnect();
   bool sendConnected(const uint8_t* data, size_t len);
@@ -70,10 +75,24 @@ class LinkLayer {
     return outstanding < maxFrame_ ? static_cast<size_t>(maxFrame_ - outstanding) : 0;
   }
   bool connectedPeerBusy() const { return peerBusy_; }
+  uint8_t hostState() const;
+  uint8_t hostRetryCount() const {
+    return state_ == LinkState::Disconnected ? 0 : retryCount_ + (t1_.running() ? 1 : 0);
+  }
+  uint16_t initialRtt() const { return static_cast<uint16_t>(config_.t1Ms / 10); }
+  uint8_t retryLimit() const { return config_.n2; }
+  uint8_t maxFrame() const { return maxFrame_; }
+  void setPath(const Address* repeaters, uint8_t count);
+  const Address* path() const { return path_; }
+  uint8_t pathCount() const { return pathCount_; }
   uint8_t outstandingFrameCount() const { return outstandingCount(); }
   uint8_t retryCount() const { return retryCount_; }
+  uint32_t resetCount() const { return resetCount_; }
+  const char* disconnectReason() const { return disconnectReason_; }
+  const uint8_t* rejectedFrame() const { return rejectedFrame_; }
   void setTimers(uint32_t t1Ms, uint32_t t2Ms, uint32_t t3Ms, uint32_t t4Ms = 60000);
   void setRetryLimit(uint8_t n2);
+  void setIPollLength(uint16_t length) { config_.iPollLength = length; }
   void setMaxFrame(uint8_t maxFrame);
   // Call after the frame actually goes on air so T1 counts from real transmission.
   void notifyTxSent();
@@ -101,7 +120,7 @@ class LinkLayer {
   };
 
   void setState(LinkState state);
-  bool transmit(const Frame& frame, bool remember);
+  bool transmit(const Frame& frame, bool remember, bool useLinkPath = true);
   bool sendNextQueued();
   bool sendIFrame(const uint8_t* data, size_t len);
   void fillWindow();
@@ -110,13 +129,14 @@ class LinkLayer {
   bool hasOutstanding() const;
   uint8_t outstandingCount() const;
   void retransmitWindow();
+  void pollRetry();
   bool retransmitOne(uint8_t nsValue);
   void storeOutstanding(const Frame& frame);
   void clearReceiveBuffer();
   bool receiveBuffered(uint8_t nsValue, Frame& out);
   bool storeReceiveBuffered(const Frame& frame);
   bool inReceiveWindow(uint8_t nsValue) const;
-  void deliverIFrame(const Frame& frame);
+  bool deliverIFrame(const Frame& frame);
   void deferAck();
   void clearRejPending();
   void requestRej(uint8_t nrValue, bool final);
@@ -138,6 +158,7 @@ class LinkLayer {
   L2Config config_{};
   TxCallback tx_ = nullptr;
   DataCallback data_ = nullptr;
+  ReadyCallback ready_ = nullptr;
   void* ctx_ = nullptr;
   LinkState state_ = LinkState::Disconnected;
   Address peer_{};
@@ -145,7 +166,13 @@ class LinkLayer {
   uint8_t va_ = 0;
   uint8_t vr_ = 0;
   uint8_t retryCount_ = 0;
+  uint32_t resetCount_ = 0;
+  const char* disconnectReason_ = "DISCONNECTED fm";
+  uint8_t rejectedFrame_[3]{};
   bool peerBusy_ = false;
+  bool localBusy_ = false;
+  Address path_[MAX_REPEATERS]{};
+  uint8_t pathCount_ = 0;
   static constexpr uint8_t WINDOW_SIZE = 7;
   WindowSlot window_[WINDOW_SIZE]{};
   ReceiveSlot receiveWindow_[WINDOW_SIZE]{};

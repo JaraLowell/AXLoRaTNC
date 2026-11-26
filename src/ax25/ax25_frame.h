@@ -55,6 +55,8 @@ struct Frame {
   uint8_t control = CTRL_UI;
   uint8_t pid = PID_NO_LAYER3;
   bool    command = true;   // C/R bit: true=command, false=response
+  bool    version2 = true;
+  bool    dama = false;
   uint8_t info[MAX_INFO_LEN]{};
   size_t infoLen = 0;
 };

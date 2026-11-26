@@ -60,6 +60,7 @@ enum class SerialMode : uint8_t {
 };
 
 class Tnc {
+  friend struct TncTestAccess;
  public:
   void begin(const char* callsign);
   void loop(bool radioReady);
@@ -84,7 +85,12 @@ class Tnc {
   struct ChannelState {
     ax25::LinkLayer   link{};
     ax25::LinkState   lastState       = ax25::LinkState::Disconnected;
+    uint32_t          lastResetCount = 0;
+    bool              connectTextPending = false;
     uint8_t           loopbackPeer    = CHANNEL_COUNT;
+    uint16_t          initialRtt = 500;
+    uint8_t           retryLimit = 20;
+    uint8_t           maxFrame = 3;
     char              nodeLine[96]{};
     size_t            nodeLinePos     = 0;
     bool              nodeGreetingSent = false;
@@ -217,7 +223,8 @@ class Tnc {
 
   // Static LinkLayer callbacks
   static bool radioTxCallback(const uint8_t* data, size_t len, void* ctx);
-  static void dataCallback(const uint8_t* data, size_t len, bool connected, void* ctx);
+  static bool dataCallback(const uint8_t* data, size_t len, bool connected, void* ctx);
+  static bool dataReadyCallback(void* ctx);
 
   // Radio helpers
   bool transmitRaw(const uint8_t* data, size_t len, uint8_t chIdx = 0xFF);
@@ -252,21 +259,23 @@ class Tnc {
   void serviceWa8dedHost(uint8_t byte);
   void serviceWa8dedTerminal(uint8_t byte);
   void handleDedTerminalLine(const char* line, bool command);
-  void handleDedAtCommand(const char* cmd);
   void applyDedLinkConfig();
   void serviceDedTerminalOutput();
   void printDedTerminalStatus(int channel) const;
   void handleDedHostFrame(uint8_t channel, uint8_t infoCmd, const uint8_t* data, size_t len);
   void handleDedCommand(uint8_t channel, const char* command, size_t len);
+  void formatDedTimestamp(char* output, size_t capacity);
+  bool setDedTimestamp(const char* value);
+  bool setDedMonitor(const char* value);
+  bool dedMonitorAllows(const ax25::Frame& frame) const;
+  bool parseDedPath(const char* value, ax25::Address& destination,
+                    ax25::Address* path, uint8_t& count, bool validate) const;
   void sendDedShort(uint8_t channel, uint8_t code);
   void writeDedReply(const uint8_t* data, size_t len);
   void sendDedText(uint8_t channel, uint8_t code, const char* text);
   void sendDedCounted(uint8_t channel, uint8_t code, const uint8_t* data, size_t len);
-  unsigned dedFreeBufferBytes(uint8_t channel) const;
-  size_t dedConnectedFrameCapacity(uint8_t chIdx) const;
+  unsigned dedFreeBufferUnits(uint8_t channel) const;
   size_t dedConnectedAcceptFrameCapacity(uint8_t chIdx) const;
-  static constexpr size_t DED_LAB_IDLE_CREDIT_FRAMES = 6;
-  static constexpr size_t DED_LAB_STREAM_CREDIT_FRAMES = 3;
   bool enqueueDedEvent(uint8_t channel, uint8_t code, const uint8_t* data, size_t len);
   size_t pendingDedEvents(uint8_t channel, uint8_t wanted = 0);
   bool popDedEvent(uint8_t channel, uint8_t wanted, DedEvent& out);
@@ -364,7 +373,22 @@ class Tnc {
   bool    dedTerminalCommand_  = false;
   bool    dedEcho_             = true;
   bool    dedAutoLf_           = true;
-  bool    dedTimestamp_        = false;
+  uint8_t dedTimestamp_        = 0;
+  uint32_t dedClockMs_         = 0;
+  uint32_t dedClockSeconds_    = 0;
+  uint8_t dedClockDay_         = 1;
+  uint8_t dedClockMonth_       = 1;
+  uint8_t dedClockYear_        = 0;
+  bool    dedClockEuropean_    = true;
+  bool    dedFlags_            = false;
+  bool    dedUiPoll_           = false;
+  uint8_t dedModemMode_        = 3;
+  uint16_t dedHdlcBaud_        = 1200;
+  uint16_t dedTerminalBaud_    = 9600;
+  uint32_t dedRoundsStartMs_   = 0;
+  uint32_t dedRoundsCount_     = 0;
+  uint32_t dedRoundsPerSecond_ = 0;
+  bool    dedMonitorPayloadPending_ = false;
   bool    dedFlow_             = true;
   bool    dedXonXoff_          = true;
   bool    dedOutputPaused_     = false;
@@ -381,13 +405,18 @@ class Tnc {
   uint8_t dedSrttA1_           = 7;
   uint8_t dedSrttA2_           = 15;
   uint8_t dedSrttA3_           = 3;
-  uint8_t dedIPollFrameLength_ = 128;   // Larger lab PACLEN for faster LinFBB text bursts
+  uint16_t dedIPollFrameLength_ = 128;
   bool    dedEightBitTerminal_ = true;
   bool    dedValidateCallsign_ = true;
   uint16_t dedT2_              = 20;    // T2 = 200 ms for quicker RR/ACK turnaround in lab tests
   uint16_t dedT3_              = 18000;
   ax25::Address dedUnprotoDestination_{};
   char    dedMonitorMode_[20]  = "IU";
+  ax25::Address dedMonitorCalls_[ax25::MAX_REPEATERS]{};
+  uint8_t dedMonitorCallCount_ = 0;
+  char dedMonitorCallFilter_ = '\0';
+  ax25::Address dedUnprotoPath_[ax25::MAX_REPEATERS]{};
+  uint8_t dedUnprotoPathCount_ = 0;
   char    dedUnattendedText_[80]{};
   char    dedLastCallsign_[12]{};
   uint8_t dedLastCallsignChannel_ = 0;

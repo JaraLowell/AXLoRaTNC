@@ -32,6 +32,7 @@ jobs:
           - env: heltec_v3
           - env: tbeam
           - env: lilygo_t3_v161
+          - env: station_g2
 
     steps:
       - uses: actions/checkout@v4

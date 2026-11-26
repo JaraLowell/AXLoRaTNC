@@ -1,238 +1,227 @@
 # WA8DED hostmode
 
-AXLoRaTNC implements the WA8DED binary host mode protocol for legacy host
-software. For LinFBB/F6FBB, the recommended setup is KISS through Linux AX.25;
-see the [FBB KISS guide](/guide/fbb-kiss).
+AXLoRaTNC's serial host protocol targets the supplied **TFPK 2.7**
+implementation of WA8DED. It does not pretend to be a PK232 or reproduce
+its HF modem hardware. GPNG is a client, not the protocol specification.
+For FBB using Linux AX.25, see the [FBB KISS guide](/guide/fbb-kiss).
 
-## Enable hostmode
+## Enter and leave hostmode
 
-Clients can enter hostmode directly from the console by sending
-`ESC JHOST1 CR`. Alternatively, switch to WA8DED terminal mode manually:
+From the console, send `ESC JHOST1 CR` directly. Alternatively, enter
+`mode ded`, then send `ESC JHOST1 CR` from WA8DED terminal mode.
+UART clients must initially use the console baud rate (115200); USB CDC
+has no corresponding physical baud-rate constraint.
+
+`JHOST0` acknowledges in binary before returning to terminal mode.
+In terminal mode, `ESC CONSOLE CR` returns to the console.
+Serial mode changes are not persisted.
+
+`CAN ESC JHOST1 CR` resynchronizes a reconnect at a request boundary.
+Escape/control bytes inside counted payloads remain data. The receive
+buffer holds a complete 259-byte request; an incomplete request is
+discarded after one second without another byte.
+
+Wi-Fi port 8100 is **KISS TCP**, not WA8DED TCP; see the [KISS guide](/guide/kiss).
+
+## Binary framing
 
 ```text
-mode ded
+host -> TNC: [channel] [command flag] [length minus 1] [payload]
+TNC -> host: [channel] [reply code] [reply-dependent payload]
 ```
 
-For UART connections, auto-entry must arrive at the console baud rate (115200);
-set `baud ded 115200` in the console if the client cannot change baud after
-entry. USB CDC does not have this physical baud-rate limitation.
+The request count is **length minus one for both commands and data**.
+Payloads are 1-256 bytes, without a required terminating NUL.
+For example, the two-character command `@B` is `01 01 01 40 42`
+on channel 1. Flag 0 sends data; flag 1 sends a command.
 
-Serial mode changes are not persisted. In WA8DED terminal mode, send
-`ESC CONSOLE CR` to return to the interactive console, or reboot.
-Extended polling on channel 255 is not supported; clients should fall back
-to polling individual channels.
+| Reply code | Meaning | Encoding after code |
+|---|---|---|
+| 0 | Success / nothing pending | None |
+| 1 | Command response | NUL-terminated text |
+| 2 | Error | NUL-terminated text |
+| 3 | Link status | NUL-terminated text |
+| 4 | Monitor header, no data follows | NUL-terminated text |
+| 5 | Monitor header, data follows on a later poll | NUL-terminated text |
+| 6 | Monitor I/UI data | Count-minus-one, then binary bytes |
+| 7 | Connected-channel data | Count-minus-one, then binary bytes |
 
-For reconnects while binary hostmode is still active, `CAN ESC JHOST1 CR`
-resynchronizes at a frame boundary. CAN and ESC inside counted frame payloads
-remain data and do not change the serial mode.
+Replies are written as complete frames with partial-write handling.
+Code 6 is not connected-channel data, and code 7 is not unproto data.
 
-## Frame format
+## Channels and polling
 
-```
-host → tnc:  [channel] [cmd] [count] [data…]
-tnc  → host: [channel] [code] [data…]
-```
+Channel 0 is the unproto/monitor channel. Connected channels are 1-8,
+or **1-10 on Station G2**. Channel 255 supports extended polling.
 
-- **channel**: 1–8 for connected channels (1–10 on Station G2), 0 for UI/unproto
-- **cmd**: 0 = info/data frame; 1 = command frame
-- **count**: number of data bytes minus 1 (data frames); for command frames this is the command length
-- **code**: 0 = ack/no event; 1 = info text; 2 = error; 3 = link status; 4 = monitor header; 5 = monitor frame; 6 = connected data; 7 = UI data
-
-## Channels
-
-| Range | Purpose |
+| Command | Selection |
 |---|---|
-| 0 | UI / unproto (broadcast) |
-| 1–8 (Station G2: 1–10) | Connected AX.25 channels |
+| `G` | Next pending status or data |
+| `G0` | Data only: monitor on channel 0, connected data on other channels |
+| `G1` | Status only (code 3) |
+| Channel 255 `G` | NUL-terminated **binary** list of pending channel numbers plus one |
 
-Station G2 supports all ten connected channels configured by GPNG by default.
-Other variants retain eight channels to fit their RAM limits.
+After a code-5 header, the next channel-0 `G`/`G0` returns its code-6
+payload. `G1` may intervene without losing that payload.
+An empty extended poll is `FF 01 00`; pending channels 0 and 2 give
+`FF 01 01 03 00`.
+
+`L` returns plain space-separated numbers:
+
+- Channel 0: pending status messages, pending monitor frames. A body
+  awaiting delivery after its header is not counted as another frame.
+- Connected channels: pending status messages, pending receive data,
+  unsent transmit frames, unacknowledged frames, retry accounting, L2 state.
+
+The last field is **not a boolean**: 0 disconnected, 1 setup, 3 disconnect
+request, 4 transfer, 5 REJ sent, 6 waiting for acknowledgment, 7 local busy,
+8 remote busy, 9 both busy, 10-12 waiting-ACK/busy combinations, and
+13-15 REJ/busy combinations. TFPK also defines 2 for frame reject; the
+current LoRa link engine disconnects on fatal frame rejection instead.
 
 ### Local loopback
 
 Connecting to a callsign configured on a local channel pairs the outgoing
-channel with the first free matching channel (lowest channel number first).
-The normal AX.25 connection, data, acknowledgement, and disconnect exchanges
-stay internal: no RF transmission, TX delay, or duty-cycle waiting is involved.
-Loopback also works with RF transmission disabled (`X0`). If all matching
-channels are busy, the connection fails rather than transmitting to yourself.
+channel with the first free matching channel, lowest number first.
+Connection, data, acknowledgment and disconnect exchanges stay internal:
+no RF transmission, TX delay or duty-cycle waiting. This also works with
+`X0`. Busy local destinations fail rather than transmitting to yourself.
 
-For example, with `I NL0MSK` configured on all channels, sending `C NL0MSK`
-on channel 1 connects it to channel 2. Both channels report their connection
-through normal hostmode events, and data sent on either appears on the other.
-An SSID such as `NL0MSK-11` works only if a local channel is explicitly
-configured with that identity; it is not an automatic internal-BBS endpoint.
+For example, `I NL0MSK` on channel 0 sets disconnected channels' identities;
+`C NL0MSK` on channel 1 then connects it to channel 2. `NL0MSK-11` must be
+explicitly configured on a channel; it is not an automatic BBS endpoint.
 
-## Commands (hostmode)
+## Commands
 
-### Connection control
+Numeric queries return the number alone, without a command prefix.
+Successful settings normally return code 0.
 
-| Command | Function |
+| Command | Meaning |
 |---|---|
-| `G` | Poll for any pending event |
-| `G0` | Poll for link-status events only (code 3) |
-| `G1` | Poll for data and link-status events (codes 3, 6, 7) |
-| `C <CALL>` | Connect to CALL on the selected channel |
-| `D` | Disconnect the selected channel |
-| `I` | Query own callsign |
-| `I <CALL>` | Set own callsign |
-| `L` | Query numeric status/buffer counters (see below) |
-| `JHOST0` | Leave hostmode, return to terminal mode |
-| `JHOST1` | Enter binary hostmode (TNC responds with ack) |
-| `V` | Query firmware version string |
-| `S` | Query selected channel |
-| `S <n>` | Select channel n (0–8; Station G2: 0–10) |
+| `C [CALL [via PATH]]` | Query peer/path or connect; channel 0 sets unproto destination/path |
+| `D` | Disconnect; disconnected channels reply `CHANNEL NOT CONNECTED` (code 1) |
+| `I [CALL]` | Query/set identity; channel 0 updates disconnected channels, not active sessions |
+| `L` | Status/counters described above |
+| `M [MODE [+/- CALLS]]` | Monitor selection/filter |
+| `JHOST [0/1]` | Query/change terminal/binary mode |
+| `K` | Query timestamp mode and software date/time |
+| `K 0/1/2` | No timestamps / status timestamps / status and monitor timestamps |
+| `K DD.MM.YY`, `K MM/DD/YY`, `K HH:MM:SS` | Set software clock; date syntax selects display format |
+| `U [0/1/2 [TEXT]]` | Unattended mode and retained, case-sensitive incoming connect text |
+| `V` | Honest identity: `AXLoRaTNC WA8DED` |
+| `B` | Processing rounds per second, read-only |
+| `Y [n]` | Incoming limit; query returns `maximum (active)` |
+| `QRES` | Reboot; does not erase saved settings |
+| `@B` | Estimated shared free storage in 32-byte buffer equivalents, not byte credits |
+| `@D [0/1]` | Full duplex; bypasses CSMA, not a diagnostics query |
+| `@I [0..256]` | I-poll retry threshold, **not PACLEN** |
+| `@T2 [n]`, `@T3 [n]` | Deferred ACK / keepalive timers in 10 ms units |
+| `@V [0/1]` | Disable/enable TFPK-style callsign validation |
+| `@S` | Numeric L2 state on connected channels; invalid on channel 0 |
+| `@DIAG` | AXLoRaTNC extension: radio/reset/serial timeout diagnostics |
 
-`L` returns two numbers on channel 0: pending monitor headers and pending
-received data frames. Connected channels return six numbers: pending link
-status messages, pending received data frames, queued transmit frames,
-unacknowledged frames, retry count, and a connected flag (0 or 1).
-No callsign or other text is appended. Use `@D` for peer diagnostics.
+`U` retains its text when only the mode changes; at most 72 characters are
+accepted. Enabling without saved text returns `NO MESSAGE AVAILABLE`.
+Incoming connections receive the text followed by CR. Mode 2 also handles
+the terminal unattended `//Q` disconnect request.
 
-Binary replies are assembled and written as complete frames, with partial-write
-handling and a serial drain before servicing the next request. Counted binary
-payloads are not interpreted as console escape commands. The serial RX buffer
-holds a complete maximum-size request (3-byte header plus 256-byte payload).
-Incomplete requests are discarded after one second without another received
-byte, allowing clients to resynchronize rather than remaining stuck mid-frame.
-For timeout diagnosis,
-`@D` also reports uptime, the ESP32 reset-reason code, failed reply writes
-(`outFail`), discarded incomplete requests (`rxTimeout`), and the maximum
-reply-write/drain time (`block_ms`).
+`@I` selects a short outstanding I-frame for retransmission with P set
+on the first two retries; at/above the threshold, or on later retries,
+the modem polls with RR. Connected host data supports full 256-byte
+frames independently of this threshold.
 
-### Parameters
+`H` and binary `S` are invalid in this TFPK variant. Terminal `S n`
+selects a channel and reports its peer. `@Q` and `IPOLL` are not aliases
+for resetting settings or setting packet length.
 
-All parameters can be queried (send without argument → TNC replies with current value as info text) or set (send with numeric argument → TNC replies with ack `0`). All settings persist in NVS.
+### Parameters and persistence
 
-| Cmd | Parameter | Default | Range |
+| Command | Parameter | Fresh default | Range |
 |---|---|---|---|
-| `A` | Auto-LF (append LF after CR) | 1 | 0–1 |
-| `B` | DAMA timeout (× 100 ms) | 120 | 0–255 |
-| `E` | Echo (terminal mode) | 1 | 0–1 |
-| `F` | FRACK — T1 retry timer (× 100 ms) | 250 | 0–255 |
-| `K` | Timestamp in monitor output | 0 | 0–1 |
-| `N` | Retry limit (N2) | 10 | 0–127 |
-| `O` | Max outstanding frames (window, MAXFRAME) | 2 | 1–7 |
-| `P` | CSMA persistence (0–255, p = (n+1)/256) | 63 | 0–255 |
-| `R` | Digipeater on/off | 0 | 0–1 |
-| `T` | TX delay (× 10 ms) | 30 | 0–127 |
-| `W` | Slot time (× 10 ms) | 10 | 0–127 |
-| `X` | TX enable | 1 | 0–1 |
-| `Y` | Max incoming connections | 4 | 0–8 (Station G2: 0–10) |
-| `Z` | Flow control: bit 0 = RTS/CTS, bit 1 = XON/XOFF | 3 | 0–3 |
-| `M` | Monitor mode string | `IU` | see below |
-| `U` | Unattended mode + connect text | 0 | 0–2 |
+| `A` | Auto-LF | 1 | 0-1 |
+| `E` | Terminal echo | 1 | 0-1 |
+| `F` | Initial RTT / fixed T1 in 10 ms units | 500 (5 s) | 1-65535 |
+| `N` | Retry limit; 0 means unlimited | 20 | 0-127 |
+| `O` | Outstanding-frame window | 3 | 1-7 |
+| `P` | CSMA persistence | 255 | 0-255 |
+| `R` | Digipeater enable | 0 | 0-1 |
+| `T` | TX delay in 10 ms units | 0 | 0-64 |
+| `W` | CSMA slot time in 10 ms units | 20 | 0-127 |
+| `X` | RF TX enable | 1 | 0-1 |
+| `Y` | Incoming connection limit | 4; Station G2 10 | 0-channel count |
+| `Z` | Bit 0 RTS/CTS; bit 1 XON/XOFF | 3 | 0-3 |
+| `@I` | I-poll length threshold | 128 | 0-256 |
+| `@T2` | Deferred ACK in 10 ms units | 20 (200 ms) | 0-65535 |
+| `@T3` | Keepalive in 10 ms units | 18000 (180 s) | 0-65535 |
 
-### Monitor mode (`M`)
+Small `F` values 1-15 use TFPK's legacy conversion `value * 100 / 3`.
+`F`, `N`, and `O` set on a connected channel are session-local.
+Channel-0 values are saved defaults, propagated only to disconnected
+channels and restored when a channel disconnects. Other configuration
+settings persist in ESP32 NVS; the software clock itself does not survive
+reboot. Existing saved values override fresh defaults.
 
-`M` queries the current monitor mode string. `M <string>` sets it. Use `M N` to disable monitoring.
+Hardware-specific `@F` (flags, 0-1), `@H` (modem mode, 0-3),
+`@N` (HF baud: 300/600/1200/2400/4800/9600), and `@O`
+(terminal baud: the same plus 19200) accept, retain and query the values,
+but do not configure a PK232 HF modem or change the actual USB/UART baud.
+Use console radio/baud commands for the real hardware.
+`@U 0/1` controls the UI poll bit.
 
-Monitor mode letters select which frame types are reported:
+## Monitor and status payloads
 
-| Letter | Frames reported |
-|---|---|
-| `I` | I-frames (connected data) |
-| `U` | Unnumbered frames (UI, SABM, UA, DISC, DM, FRMR) |
-| `S` | Supervisory frames (RR, RNR, REJ, SREJ) |
-| `N` | None (monitor disabled) |
+`M IUSC` enables I-frames, UI, supervisory/non-UI unnumbered frames,
+and monitoring while the selected terminal channel is connected.
+`M N` disables monitoring. `+` includes only matching source/destination
+calls; `-` excludes matching calls. SSIDs are ignored. Up to six calls
+are accepted; excess entries are rejected, not silently truncated.
+For example: `M IU + NL0MSK N1ABC`; `M IU -` clears the filter.
 
-Example: `M IU` (default) reports UI traffic and connection control frames but not RR/RNR supervisory frames.
-
-### Buffer query (`@B`)
-
-Query the number of free TX buffers available on the selected channel:
-
-```
-host → tnc:  [ch] [1] [2] @B\0
-tnc  → host: [ch] [1] <free-buffers as text>
-```
-
-### Reset to defaults (`@Q` / `QRES`)
-
-Resets all DED parameters to factory defaults and saves them to NVS.
-
-### PACLEN (`IPOLL`)
-
-Sets the maximum I-frame info field size in bytes (default 60). Large frames are automatically fragmented into PACLEN-sized chunks before being queued to the AX.25 layer.
-
-```
-host → tnc:  [ch] [1] [n] IPOLL <value>\0
+```text
+fm N1ABC-3 to CQ via N2DIG N3DIG* ctl UI^ pid F0
+fm N1ABC to N2ABC ctl I42+ pid F0
+fm N1ABC to N2ABC ctl RR3v
 ```
 
-## Terminal mode (before JHOST1)
+I-frame digits are N(R), then N(S). Markers are `+` command/P,
+`-` response/F, `^` command without P, and `v` response without F.
+Legacy frames use `!` for P/F. FRMR reject bytes are included in the
+header, not delivered as a separate data payload. No RSSI/SNR decoration
+is added to the protocol header.
 
-In terminal mode (after `mode ded` but before `JHOST1`) the TNC accepts plain text commands, one per line. All single-letter parameters above are accepted, plus:
+TFPK-style link status includes the channel prefix in the text as well
+as the binary channel byte:
 
-| Command | Function |
-|---|---|
-| `MYCALL [CALL]` | Query or set own callsign |
-| `UNPROTO [DEST]` | Query or set unproto destination |
-| `BTEXT [text]` | Query or set beacon text |
-| `CONNECT <CALL>` | Connect on current channel |
-| `DISCONNECT` | Disconnect current channel |
-| `ESC JHOST1 CR` | Switch to binary hostmode |
-| `QRES` | Reset all DED parameters to defaults |
-
-## Event codes (TNC → host)
-
-| Code | Meaning | Data |
-|---|---|---|
-| 0 | Acknowledgement / no event | none |
-| 1 | Informational text | null-terminated string |
-| 2 | Error text | null-terminated string |
-| 3 | Link status change | null-terminated string (see below) |
-| 4 | Monitor frame header (terminal mode) | null-terminated string |
-| 5 | Monitor frame header (hostmode) | null-terminated string |
-| 6 | Connected data received | length-prefixed bytes |
-| 7 | UI data received | length-prefixed bytes |
-
-### Link status strings (code 3)
-
-| String | Meaning |
-|---|---|
-| `CONNECTED to <CALL>` | Incoming or outgoing connection established |
-| `DISCONNECTED fm <CALL>` | Link cleanly disconnected |
-| `DISCONNECTING fm <CALL>` | Disconnect in progress |
-| `LINK FAILURE with <CALL>` | T1 retry limit exceeded (Recovery state) |
-| `LINK RESET to station <CALL>` | SABM received while already connected |
-
-In hostmode the channel number is in the frame header byte — the status string contains only the text above. In terminal mode the string is prefixed with `(n)` so the operator knows which channel changed.
-
-### Monitor frame format (code 5)
-
-```
-FM <SRC> TO <DST> [VIA <R1>,<R2>] <TYPE> RSSI=<x> SNR=<y>[:<info>]
+```text
+(1) CONNECTED to N1ABC via N2DIG
+(1) DISCONNECTED fm N1ABC
+(1) BUSY fm N1ABC
+(1) LINK FAILURE with N1ABC
+(1) LINK RESET fm N1ABC
+(1) FRAME REJECT fm N1ABC (012008)
 ```
 
-`<TYPE>` is one of: `UI`, `I`, `RR`, `RNR`, `REJ`, `SREJ`, `SABM`, `UA`, `DISC`, `DM`, `FRMR`.
+Entering retry recovery is not itself a link failure. Status events are
+retained when the host event queue is full. Connected receive backpressure
+sends RNR without advancing the acknowledgment until data can be retained.
+Monitor traffic is bounded to protect connected data and status capacity.
 
-## Flow control
+## Compatibility limits and validation
 
-**XON/XOFF** (enabled by default, `Z` bit 1): `0x13` (XOFF) pauses TNC output; `0x11` (XON) resumes. In binary hostmode the control bytes are detected at frame boundaries so they cannot collide with channel bytes.
+The LoRa link engine is not a complete reproduction of TFPK's adaptive
+SRTT/DAMA state machine: `F` reports its configured fixed RTT rather than
+measured SRTT; fatal frame rejection disconnects instead of entering TFPK's
+FRMR/reset sequence. HF-modem-only settings are compatibility storage.
+Client interoperability still requires testing with real host software.
 
-**Hardware RTS/CTS** (enabled when variant defines `PIN_UART_RTS`/`PIN_UART_CTS`): the UART hardware flow control lines are asserted automatically.
+Native tests compile the actual TNC, framing and link code with fake
+serial/radio/NVS interfaces, without accessing a modem or transmitting RF:
 
-## Compatible software
+```powershell
+.\test\run-native.ps1
+```
 
-| Software | Setup notes |
-|---|---|
-| **F6FBB** | Host type `D`; set port to the ESP32 serial port |
-| **TFPCX + TSTHOST** | Load TFPCX first (`tfpcx -pCOM1 -b9600`), then launch TSTHOST |
-| **WinPack** | Select TNC type WA8DED, set COM port and baud rate |
-| **BPQ32 / LinBPQ** | Use port type `DED`; set `PORTCOM` to the ESP32 serial device |
-| **JNOS** | Interface type `asy` with `tnc` set to `ded` |
-| **Graphic Packet** | Direct WA8DED port |
-| **PaxTerm** | Direct WA8DED port |
-
-## AX.25 link layer settings
-
-The following AX.25 parameters are shared between KISS and WA8DED modes:
-
-| Parameter | Default | DED command |
-|---|---|---|
-| T1 retry timer | 25 s (F × 100 ms) | `F` |
-| T2 deferred-ack | 1.5 s | `@T2` |
-| T3 keepalive | 180 s | `@T3` |
-| N2 retry limit | 10 | `N` |
-| Window size (MAXFRAME) | 2 | `O` |
-| PACLEN (info field) | 60 bytes | `IPOLL` |
+The runner requires Visual Studio C++ Build Tools. It covers command
+responses, monitor formatting/filtering, selective/extended polling,
+channel events and counters, 256-byte binary payloads, full-queue status
+retention, receive backpressure, I-poll retries and UI path isolation.

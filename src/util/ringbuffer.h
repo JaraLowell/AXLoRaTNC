@@ -36,6 +36,22 @@ class RingBuffer {
     return true;
   }
 
+  bool peek(size_t index, T& out) const {
+    if (index >= count_) return false;
+    out = items_[(tail_ + index) % Capacity];
+    return true;
+  }
+
+  bool remove(size_t index, T& out) {
+    if (!peek(index, out)) return false;
+    for (size_t i = index; i + 1 < count_; ++i) {
+      items_[(tail_ + i) % Capacity] = items_[(tail_ + i + 1) % Capacity];
+    }
+    head_ = (head_ + Capacity - 1) % Capacity;
+    --count_;
+    return true;
+  }
+
   bool empty() const { return count_ == 0; }
   bool full() const { return count_ == Capacity; }
   size_t size() const { return count_; }

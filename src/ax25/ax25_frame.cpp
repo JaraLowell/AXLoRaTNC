@@ -124,6 +124,8 @@ bool decodeFrame(const uint8_t* data, size_t len, Frame& out, bool expectFcs) {
   if (!decodeAddress(&data[p], out.source, last)) {
     return false;
   }
+  out.version2 = out.command != ((data[p + 6] & 0x80) != 0);
+  out.dama = (data[p + 6] & 0x20) == 0;
   p += 7;
   while (!last && out.repeaterCount < MAX_REPEATERS && p + 7 <= frameLen) {
     if (!decodeAddress(&data[p], out.repeaters[out.repeaterCount], last)) {

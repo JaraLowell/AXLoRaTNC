@@ -24,6 +24,7 @@ Use the browser-based installer — no drivers or tools needed. Works in Chrome 
 ### Station G2
 
 Build with `pio run -e station_g2` and flash with `pio run -e station_g2 --target upload`.
+The GitHub firmware workflow also builds Station G2, publishes its web-flasher manifest, and includes a Station G2 ZIP on published releases.
 The pinout, TCXO, RF switch and amplifier drive limit follow [MeshCore's Station G2 configuration](https://github.com/meshcore-dev/MeshCore/blob/main/variants/station_g2/platformio.ini).
 Connect the native USB port, configure the radio and callsign in the console, then enter `mode kiss` before connecting a KISS host. The firmware starts in console mode again after reset.
 
@@ -282,40 +283,45 @@ See [local loopback](website/guide/wa8ded.md#local-loopback) for examples.
 
 | Command | Function |
 |---|---|
-| `G` / `G0` / `G1` | Poll for events |
+| `G` / `G0` / `G1` | Poll for all / data only / status only; channel 255 `G` lists pending channels |
 | `C <CALL>` | Connect on channel n |
 | `D` | Disconnect channel n |
 | `I [CALL]` | Query / set own callsign |
 | `L` | Numeric status/buffer counters: 2 on channel 0, 6 on connected channels |
 | `M [string]` | Query / set monitor mode (`I`/`U`/`S` letters, `N` = off) |
 | `V` | Firmware version string |
-| `S [n]` | Query / select channel (0–8; Station G2: 0–10) |
+| `S [n]` | Terminal-only channel selection; invalid in binary hostmode |
 | `U [n]` | Unattended mode (0 = off, 1/2 = on with auto-text) |
 | `JHOST0` | Return to terminal mode |
 | `JHOST1` | Enter binary hostmode (acknowledged) |
-| `@B` | TX buffer free bytes |
-| `@Q` / `QRES` | Reset all DED parameters to defaults |
+| `@B` | Shared free storage in 32-byte buffer equivalents |
+| `@D [0/1]` | Full duplex; `@DIAG` is the diagnostics extension |
+| `@I [0..256]` | I-poll retry threshold, not PACLEN |
+| `QRES` | Reboot without erasing saved settings |
 
 ### Parameters (query / set)
 
 | Cmd | Parameter | Default |
 |---|---|---|
 | `A` | Auto-LF | 1 |
-| `B` | DAMA timeout | 120 |
+| `B` | Processing rounds per second (read-only) | — |
 | `E` | Echo | 1 |
-| `F` | FRACK (T1 × 100 ms) | 250 |
+| `F` | Initial RTT / fixed T1 (× 10 ms) | 500 |
 | `K` | Timestamp in monitor | 0 |
-| `N` | Retry limit (N2) | 10 |
-| `O` | Max outstanding frames (MAXFRAME) | 2 |
-| `P` | CSMA persistence | 63 |
+| `N` | Retry limit (N2) | 20 |
+| `O` | Max outstanding frames (MAXFRAME) | 3 |
+| `P` | CSMA persistence | 255 |
 | `R` | Digipeater on/off | 0 |
-| `T` | TX delay (× 10 ms) | 30 |
-| `W` | Slot time (× 10 ms) | 10 |
+| `T` | TX delay (× 10 ms) | 0 |
+| `W` | Slot time (× 10 ms) | 20 |
 | `X` | TX enable | 1 |
 | `Y` | Max incoming connections | 4 |
 | `Z` | Flow control (bit 0 = RTS/CTS, bit 1 = XON/XOFF) | 3 |
 
-All parameters persist in NVS across reboots.
+Global configuration persists in NVS. Channel-specific `F`/`N`/`O` settings
+are session-local; disconnected channels inherit channel-0 defaults.
+Request counts are length-minus-one for commands and data alike (1–256 bytes).
+See the [WA8DED guide](website/guide/wa8ded.md) for ranges and compatibility limits.
 
 ### Event codes
 
@@ -325,11 +331,13 @@ All parameters persist in NVS across reboots.
 | 1 | Informational text |
 | 2 | Error text |
 | 3 | Link status change (`CONNECTED to CALL`, `DISCONNECTED fm CALL`, `LINK FAILURE with CALL`) |
-| 5 | Monitor frame header |
-| 6 | Connected data received |
-| 7 | UI data received |
+| 4 | Monitor header with no data payload |
+| 5 | Monitor header followed by data on a later poll |
+| 6 | Monitor I/UI data (counted binary payload) |
+| 7 | Connected data (counted binary payload) |
 
-Monitor frame format: `FM SRC TO DST [VIA R1,R2] <TYPE> RSSI=x SNR=y[:info]`
+Monitor format: `fm SRC to DST [via R1 R2*] ctl UI^ pid F0`.
+Connected `L` replies end with a numeric L2 state, not a connected boolean.
 
 Legacy hostmode compatibility target: TFPCX/TSTHOST, WinPack, BPQ32/LinBPQ (port type `DED`), JNOS, Graphic Packet, PaxTerm. For F6FBB/LinFBB, KISS through Linux AX.25 is recommended.
 
@@ -411,4 +419,4 @@ RadioLib is isolated under `src/radio/`. The AX.25 stack under `src/ax25/` has n
 **Serial interfaces**
 - Console (human-readable, all commands)
 - KISS (compatible with all standard KISS software)
-- WA8DED hostmode: 8 channels (10 on Station G2), full command set (G/C/D/I/L/M/S/U/V/JHOST + A/B/E/F/K/N/O/P/R/T/W/X/Y/Z parameters + @B/@Q), event codes 0–7, monitor mode with frame-type filter (I/U/S), PACLEN fragmentation, XON/XOFF and hardware flow control, FRMR handling, NVS-persistent parameters, compatible with F6FBB, TFPCX, WinPack, BPQ32, JNOS
+- WA8DED hostmode: 8 channels (10 on Station G2), TFPK 2.7-style command replies, selective/extended polling, event codes 0–7, canonical monitor headers with I/U/S/C and callsign filters, 256-byte connected payloads, receive backpressure, I-poll retries, local loopback and NVS-persistent global configuration. See the [WA8DED guide](website/guide/wa8ded.md) for compatibility limits.

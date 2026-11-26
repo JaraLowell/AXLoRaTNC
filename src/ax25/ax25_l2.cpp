@@ -13,16 +13,22 @@ uint8_t seqDistance(uint8_t from, uint8_t to) {
 
 }  // namespace
 
-void LinkLayer::begin(const L2Config& config, TxCallback tx, DataCallback data, void* ctx) {
+void LinkLayer::begin(const L2Config& config, TxCallback tx, DataCallback data, void* ctx,
+                      ReadyCallback ready) {
   config_ = config;
   if (maxFrame_ == 0 || maxFrame_ > WINDOW_SIZE) maxFrame_ = WINDOW_SIZE;
   tx_ = tx;
   data_ = data;
+  ready_ = ready;
   ctx_ = ctx;
   setState(LinkState::Disconnected);
 }
 
 void LinkLayer::loop() {
+  if (localBusy_ && ready_ != nullptr && ready_(ctx_)) {
+    localBusy_ = false;
+    sendSupervisory(SFrameType::RR);
+  }
   if (t1_.expired()) {
     ++stats_.t1Expired;
     if (config_.n2 != 0 && retryCount_ >= config_.n2) {
@@ -36,6 +42,7 @@ void LinkLayer::loop() {
       t2PendingAck_ = false;
       t4_.stop();
       clearRejPending();
+      disconnectReason_ = "LINK FAILURE with";
       setState(LinkState::Disconnected);
       return;
     }
@@ -48,14 +55,10 @@ void LinkLayer::loop() {
       t2PendingAck_ = false;
       setState(LinkState::Recovery);
       LOG_PROTO("AX25 T1 recovery retransmit outstanding=%u", outstandingCount());
-      retransmitWindow();
-      LOG_PROTO("AX25 TX RR P=1 NR=%u reason=T1_RECOVERY outstanding=%u", vr_, outstandingCount());
-      sendSupervisory(SFrameType::RR, true);
+      pollRetry();
     } else if (state_ == LinkState::Recovery && hasOutstanding()) {
       LOG_PROTO("AX25 T1 recovery retry retransmit outstanding=%u retry=%u", outstandingCount(), retryCount_);
-      retransmitWindow();
-      LOG_PROTO("AX25 TX RR P=1 NR=%u reason=T1_RETRY retry=%u", vr_, retryCount_);
-      sendSupervisory(SFrameType::RR, true);
+      pollRetry();
     } else if (state_ == LinkState::Connecting) {
       sendUnnumbered(UFrameType::SABM);
     } else if (state_ == LinkState::Disconnecting) {
@@ -92,15 +95,21 @@ void LinkLayer::loop() {
   }
 }
 
-bool LinkLayer::sendUi(const Address& destination, const uint8_t* data, size_t len) {
+bool LinkLayer::sendUi(const Address& destination, const uint8_t* data, size_t len,
+                       const Address* path, uint8_t pathCount, bool poll, const Address* source) {
   Frame frame{};
   frame.destination = destination;
-  frame.source = config_.local;
-  frame.control = CTRL_UI;
+  frame.source = source == nullptr ? config_.local : *source;
+  frame.repeaterCount = path == nullptr ? pathCount_ : pathCount;
+  if (frame.repeaterCount > MAX_REPEATERS) return false;
+  if (frame.repeaterCount > 0)
+    memcpy(frame.repeaters, path == nullptr ? path_ : path,
+           frame.repeaterCount * sizeof(Address));
+  frame.control = makeU(UFrameType::UI, poll);
   frame.pid = PID_NO_LAYER3;
   frame.infoLen = len > MAX_INFO_LEN ? MAX_INFO_LEN : len;
   memcpy(frame.info, data, frame.infoLen);
-  const bool ok = transmit(frame, false);
+  const bool ok = transmit(frame, false, false);
   if (ok) {
     ++stats_.uiTx;
   }
@@ -112,11 +121,13 @@ bool LinkLayer::connectTo(const Address& destination) {
     return false;
   }
   peer_ = destination;
+  disconnectReason_ = "DISCONNECTED fm";
   vs_ = 0;
   va_ = 0;
   vr_ = 0;
   retryCount_ = 0;
   peerBusy_ = false;
+  localBusy_ = false;
   t2_.stop();
   t2PendingAck_ = false;
   clearRejPending();
@@ -127,7 +138,20 @@ bool LinkLayer::connectTo(const Address& destination) {
 }
 
 bool LinkLayer::disconnect() {
+  disconnectReason_ = "DISCONNECTED fm";
   if (state_ == LinkState::Disconnected) {
+    return true;
+  }
+  if (state_ == LinkState::Connecting || state_ == LinkState::Disconnecting) {
+    clearWindow();
+    clearReceiveBuffer();
+    txQueue_.clear();
+    t1_.stop();
+    t2_.stop();
+    t3_.stop();
+    t4_.stop();
+    peerBusy_ = false;
+    setState(LinkState::Disconnected);
     return true;
   }
   retryCount_ = 0;
@@ -141,12 +165,14 @@ bool LinkLayer::disconnect() {
 }
 
 bool LinkLayer::sendConnected(const uint8_t* data, size_t len) {
-  if (state_ != LinkState::Connected || data == nullptr || len == 0) {
+  if ((state_ != LinkState::Connected && state_ != LinkState::Recovery) ||
+      data == nullptr || len == 0) {
     return false;
   }
-  if (!windowFull() && !peerBusy_ && txQueue_.empty()) {
+  if (state_ == LinkState::Connected && !windowFull() && !peerBusy_ && txQueue_.empty()) {
     return sendIFrame(data, len);
   }
+
   QueuedInfo queued{};
   queued.len = len > MAX_INFO_LEN ? MAX_INFO_LEN : len;
   memcpy(queued.data, data, queued.len);
@@ -157,6 +183,25 @@ bool LinkLayer::sendConnected(const uint8_t* data, size_t len) {
   ++stats_.queued;
   LOG_PROTO("AX25 queued connected data depth=%u", static_cast<unsigned>(txQueue_.size()));
   return true;
+}
+
+void LinkLayer::setPath(const Address* repeaters, uint8_t count) {
+  pathCount_ = count > MAX_REPEATERS ? MAX_REPEATERS : count;
+  memset(path_, 0, sizeof(path_));
+  if (pathCount_ > 0) memcpy(path_, repeaters, pathCount_ * sizeof(Address));
+}
+
+uint8_t LinkLayer::hostState() const {
+  switch (state_) {
+    case LinkState::Disconnected: return 0;
+    case LinkState::Connecting: return 1;
+    case LinkState::Disconnecting: return 3;
+    default:
+      if (rejPending_) return localBusy_ ? (peerBusy_ ? 15 : 13) : (peerBusy_ ? 14 : 5);
+      if (state_ == LinkState::Recovery)
+        return localBusy_ ? (peerBusy_ ? 12 : 10) : (peerBusy_ ? 11 : 6);
+      return localBusy_ ? (peerBusy_ ? 9 : 7) : (peerBusy_ ? 8 : 4);
+  }
 }
 
 void LinkLayer::setTimers(uint32_t t1Ms, uint32_t t2Ms, uint32_t t3Ms, uint32_t t4Ms) {
@@ -258,18 +303,23 @@ void LinkLayer::setState(LinkState state) {
   }
 }
 
-bool LinkLayer::transmit(const Frame& frame, bool remember) {
+bool LinkLayer::transmit(const Frame& frame, bool remember, bool useLinkPath) {
   if (tx_ == nullptr) {
     return false;
   }
   uint8_t bytes[MAX_PACKET_BYTES]{};
   size_t len = 0;
-  if (!encodeFrame(frame, bytes, sizeof(bytes), len, true)) {
+  Frame routed = frame;
+  if (useLinkPath && routed.repeaterCount == 0) {
+    routed.repeaterCount = pathCount_;
+    memcpy(routed.repeaters, path_, sizeof(path_));
+  }
+  if (!encodeFrame(routed, bytes, sizeof(bytes), len, true)) {
     return false;
   }
   const bool ok = tx_(bytes, len, ctx_);
   if (ok && remember) {
-    storeOutstanding(frame);
+    storeOutstanding(routed);
     retryCount_ = 0;
     t1_.start(config_.t1Ms);
   }
@@ -333,6 +383,22 @@ void LinkLayer::retransmitWindow() {
   }
 }
 
+void LinkLayer::pollRetry() {
+  if (!peerBusy_ && retryCount_ < 3) {
+    for (const WindowSlot& slot : window_) {
+      if (slot.active && ns(slot.frame.control) == va_ &&
+          slot.frame.infoLen < config_.iPollLength) {
+        Frame frame = slot.frame;
+        frame.control = makeI(va_, vr_, true);
+        ++stats_.retx;
+        transmit(frame, false);
+        return;
+      }
+    }
+  }
+  sendSupervisory(SFrameType::RR, true);
+}
+
 bool LinkLayer::retransmitOne(uint8_t nsValue) {
   for (const WindowSlot& slot : window_) {
     if (slot.active && ns(slot.frame.control) == nsValue) {
@@ -354,6 +420,7 @@ void LinkLayer::storeOutstanding(const Frame& frame) {
 }
 
 void LinkLayer::clearReceiveBuffer() {
+  localBusy_ = false;
   for (ReceiveSlot& slot : receiveWindow_) {
     slot.active = false;
   }
@@ -395,16 +462,20 @@ bool LinkLayer::inReceiveWindow(uint8_t nsValue) const {
   return distance > 0 && distance < maxFrame_;
 }
 
-void LinkLayer::deliverIFrame(const Frame& frame) {
+bool LinkLayer::deliverIFrame(const Frame& frame) {
+  if (frame.infoLen > 0 && data_ != nullptr &&
+      !data_(frame.info, frame.infoLen, true, ctx_)) {
+    localBusy_ = true;
+    LOG_WARN("AX25 receive host busy; withholding acknowledgement NR=%u", vr_);
+    return false;
+  }
   srejPending_[ns(frame.control)] = false;
   vr_ = static_cast<uint8_t>((vr_ + 1) & 0x07);
   if (rejPending_ && rejNr_ == ns(frame.control)) {
     clearRejPending();
   }
   ++stats_.iRx;
-  if (data_ != nullptr) {
-    data_(frame.info, frame.infoLen, true, ctx_);
-  }
+  return true;
 }
 
 void LinkLayer::deferAck() {
@@ -436,6 +507,7 @@ void LinkLayer::requestRej(uint8_t nrValue, bool final) {
 }
 
 bool LinkLayer::sendSupervisoryFrame(SFrameType type, uint8_t nrValue, bool pf, bool command) {
+  if (localBusy_ && type == SFrameType::RR) type = SFrameType::RNR;
   Frame frame{};
   frame.destination = peer_;
   frame.source = config_.local;
@@ -498,10 +570,19 @@ void LinkLayer::handleI(const Frame& frame) {
   }
   processAck(nr(frame.control));
   if (ns(frame.control) == vr_) {
-    deliverIFrame(frame);
+    if (!deliverIFrame(frame)) {
+      t2_.stop();
+      t2PendingAck_ = false;
+      sendSupervisoryFrame(SFrameType::RNR, vr_, (frame.control & 0x10) != 0, false);
+      return;
+    }
     Frame buffered{};
     while (receiveBuffered(vr_, buffered)) {
-      deliverIFrame(buffered);
+      if (!deliverIFrame(buffered)) {
+        storeReceiveBuffered(buffered);
+        sendSupervisory(SFrameType::RNR);
+        return;
+      }
     }
     const bool pollBit = frame.command && ((frame.control & 0x10) != 0);
     if (pollBit) {
@@ -648,6 +729,11 @@ void LinkLayer::handleU(const Frame& frame) {
   if (type == UFrameType::SABM) {
     const bool wasConnected = (state_ == LinkState::Connected || state_ == LinkState::Recovery);
     peer_ = frame.source;
+    pathCount_ = frame.repeaterCount;
+    for (uint8_t i = 0; i < pathCount_; ++i) {
+      path_[i] = frame.repeaters[pathCount_ - i - 1];
+      path_[i].repeated = false;
+    }
     vs_ = 0;
     va_ = 0;
     vr_ = 0;
@@ -660,6 +746,7 @@ void LinkLayer::handleU(const Frame& frame) {
     txQueue_.clear();
     t1_.stop();
     if (wasConnected) {
+      ++resetCount_;
       LOG_PROTO("AX25 SABM rx while %s → sequences reset (re-SABM)", stateName(state_));
     } else {
       LOG_PROTO("AX25 SABM rx state=%s → Connected", stateName(state_));
@@ -692,6 +779,7 @@ void LinkLayer::handleU(const Frame& frame) {
   }
 
   if (type == UFrameType::DISC) {
+    disconnectReason_ = state_ == LinkState::Connecting ? "BUSY fm" : "DISCONNECTED fm";
     peer_ = frame.source;
     sendUnnumbered(UFrameType::UA);
     clearWindow();
@@ -707,6 +795,7 @@ void LinkLayer::handleU(const Frame& frame) {
   }
 
   if (type == UFrameType::DM) {
+    disconnectReason_ = state_ == LinkState::Connecting ? "BUSY fm" : "DISCONNECTED fm";
     clearWindow();
     clearReceiveBuffer();
     txQueue_.clear();
@@ -720,6 +809,9 @@ void LinkLayer::handleU(const Frame& frame) {
   }
 
   if (type == UFrameType::FRMR) {
+    disconnectReason_ = "FRAME REJECT fm";
+    memset(rejectedFrame_, 0, sizeof(rejectedFrame_));
+    memcpy(rejectedFrame_, frame.info, frame.infoLen < 3 ? frame.infoLen : 3);
     LOG_PROTO("AX25 FRMR received, resetting link");
     clearWindow();
     clearReceiveBuffer();
@@ -821,6 +913,8 @@ void LinkLayer::sendFrmr(uint8_t rejectedControl, bool cr, uint8_t reasonBits) {
   frame.info[1] = static_cast<uint8_t>((vr_ << 5) | (cr ? 0x10 : 0x00) | (vs_ << 1));
   frame.info[2] = reasonBits;
   frame.infoLen = 3;
+  disconnectReason_ = "FRAME REJECT to";
+  memcpy(rejectedFrame_, frame.info, sizeof(rejectedFrame_));
   transmit(frame, false);
   ++stats_.frmrTx;
   LOG_PROTO("AX25 FRMR tx ctrl=0x%02X reason=0x%02X", rejectedControl, reasonBits);
