@@ -11,6 +11,7 @@
 #include "mailbox.h"
 #include "radio/radio.h"
 #include "util/ringbuffer.h"
+#include "wifi_kiss.h"
 
 namespace axlora::tnc {
 
@@ -234,7 +235,14 @@ class Tnc {
 
   // Serial
   void serviceSerial();
-  void handleKiss(const ax25::KissFrame& frame);
+  void handleKiss(const ax25::KissFrame& frame, bool fromTcp = false);
+  bool kissTcpActive() const {
+#if defined(AXLORA_VARIANT_STATION_G2)
+    return wifiKiss_.active();
+#else
+    return false;
+#endif
+  }
   void emitKissData(const uint8_t* frameNoFcs, size_t len);
   void handleConsoleLine(char* line);
   void handleQuietEscape(uint8_t byte);
@@ -335,6 +343,9 @@ class Tnc {
   char              escapeLine_[16]{};
   size_t            escapePos_   = 0;
   SerialMode        serialMode_  = SerialMode::Console;
+#if defined(AXLORA_VARIANT_STATION_G2)
+  WifiKiss          wifiKiss_;
+#endif
   uint32_t          baudKiss_    = 9600;
   uint32_t          baudDed_     = 9600;
 

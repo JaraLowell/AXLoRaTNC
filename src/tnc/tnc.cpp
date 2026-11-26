@@ -233,6 +233,9 @@ void Tnc::begin(const char* callsign) {
     channelCtx_[i].chIdx = i;
     beginLink(i, local_);
   }
+#if defined(AXLORA_VARIANT_STATION_G2)
+  wifiKiss_.begin();
+#endif
 }
 
 void Tnc::beginLink(uint8_t chIdx, const ax25::Address& local) {
@@ -262,6 +265,20 @@ bool Tnc::setChannelLocal(uint8_t chIdx, const ax25::Address& local) {
 
 void Tnc::loop(bool radioReady) {
   serviceSerial();
+#if defined(AXLORA_VARIANT_STATION_G2)
+  bool allowTcpClient = serialMode_ == SerialMode::Console;
+  for (const ChannelState& channel : channels_) {
+    if (channel.link.state() != ax25::LinkState::Disconnected) allowTcpClient = false;
+  }
+  wifiKiss_.loop(allowTcpClient);
+  for (uint8_t count = 0; count < 4 && wifiKiss_.active(); ++count) {
+    if (rawTxQueue_.free() <= KISS_SERIAL_TXQ_HEADROOM &&
+        rawTxPriorityQueue_.free() == 0) break;
+    ax25::KissFrame frame{};
+    if (!wifiKiss_.readFrame(frame)) break;
+    handleKiss(frame, true);
+  }
+#endif
   serviceLoopbackTx();
   if (radioReady) {
     if (!radioConfigApplied_) {
@@ -442,7 +459,7 @@ void Tnc::serviceRawTx(bool radioReady) {
     // Echo transmitted frames as KISS only on the console port. In WA8DED hostmode
     // the same serial stream belongs to the host protocol and raw KISS bytes would
     // force clients such as LinFBB to resync before seeing pending events.
-    if (serialMode_ == SerialMode::Console && tx.len >= 2) {
+    if (serialMode_ == SerialMode::Console && !kissTcpActive() && tx.len >= 2) {
       emitKissData(tx.data, tx.len - 2);
     }
     // Restart T1 from now — frame is on air. Corrects for CSMA + LoRa airtime delay.
@@ -565,10 +582,11 @@ void Tnc::serviceRadio() {
                    static_cast<unsigned>(frame.pid),
                    static_cast<unsigned>(frame.infoLen));
     }
-    if (serialMode_ == SerialMode::Console || serialMode_ == SerialMode::Kiss) {
+    const bool tcpOwnsReceive = kissTcpActive();
+    if (serialMode_ == SerialMode::Console || serialMode_ == SerialMode::Kiss || tcpOwnsReceive) {
       emitKissData(rx.data, rx.len - 2);
     }
-    if (serialMode_ == SerialMode::Kiss) return;
+    if (serialMode_ == SerialMode::Kiss || tcpOwnsReceive) return;
     if (decoded) {
       // Detect APRS (UI, PID=0xF0) and log parsed content
       if (ax25::kind(frame.control) == ax25::FrameKind::U &&
@@ -753,6 +771,10 @@ void Tnc::serviceSerial() {
     }
     if (linePos_ < sizeof(line_) - 1) {
       line_[linePos_++] = static_cast<char>(b);
+#if defined(AXLORA_VARIANT_STATION_G2)
+      // Do not echo Wi-Fi credentials to the USB terminal.
+      if (linePos_ < 5 || strncmp(line_, "wifi ", 5) != 0)
+#endif
       Serial.write(b);
     } else {
       Serial.write(static_cast<uint8_t>(0x07));
@@ -760,9 +782,17 @@ void Tnc::serviceSerial() {
   }
 }
 
-void Tnc::handleKiss(const ax25::KissFrame& frame) {
+void Tnc::handleKiss(const ax25::KissFrame& frame, bool fromTcp) {
   // TAPR KISS "Return" (C0 FF C0): leave KISS for the command console.
   if (frame.port == 0x0F && static_cast<uint8_t>(frame.command) == 0x0F) {
+#if defined(AXLORA_VARIANT_STATION_G2)
+    if (fromTcp) {
+      wifiKiss_.closeClient();
+      return;
+    }
+#else
+    (void)fromTcp;
+#endif
     setSerialMode(SerialMode::Console);
     return;
   }
@@ -850,6 +880,13 @@ void Tnc::emitKissData(const uint8_t* frameNoFcs, size_t len) {
   uint8_t encoded[(MAX_PACKET_BYTES * 2) + 4]{};
   size_t encodedLen = 0;
   if (ax25::encodeKiss(kissFrame, encoded, sizeof(encoded), encodedLen)) {
+#if defined(AXLORA_VARIANT_STATION_G2)
+    if (wifiKiss_.active()) {
+      wifiKiss_.sendFrame(encoded, encodedLen);
+      ++kissOutFrames_;
+      return;
+    }
+#endif
     const uint32_t startMs = axlora::util::nowMs();
     if (!serialWriteAll(encoded, encodedLen)) {
       ++kissOutPartialWrites_;
@@ -871,6 +908,13 @@ void Tnc::emitKissData(const uint8_t* frameNoFcs, size_t len) {
 // ---------------------------------------------------------------------------
 
 void Tnc::handleConsoleLine(char* line) {
+#if defined(AXLORA_VARIANT_STATION_G2)
+  if (strcmp(line, "wifi") == 0 || strncmp(line, "wifi ", 5) == 0) {
+    wifiKiss_.command(line + (line[4] == ' ' ? 5 : 4));
+    memset(line, 0, sizeof(line_));
+    return;
+  }
+#endif
   char* cmd = strtok(line, " ");
   if (cmd == nullptr) return;
 
@@ -898,6 +942,9 @@ void Tnc::handleConsoleLine(char* line) {
     Serial.println("          mheard [clear] digi [on|off|mode ui|all] digialias [CALL|off]");
     Serial.println("          node [on|off|alias|ident|interval|broadcast] nodes routes");
     Serial.println("          KISS ON (enter KISS; KISS frame C0 FF C0 returns here)");
+#if defined(AXLORA_VARIANT_STATION_G2)
+    Serial.println("          wifi [status|off|sta|ap|ssid <name>|password <value>|password clear]");
+#endif
 
   } else if (strcmp(cmd, "info") == 0) {
     printInfo();
@@ -1487,6 +1534,10 @@ bool Tnc::connect(uint8_t chIdx, const char* destination) {
 }
 
 bool Tnc::connectChannel(uint8_t chIdx, const ax25::Address& destination) {
+  if (kissTcpActive()) {
+    LOG_WARN("local connection rejected: KISS TCP owns the radio");
+    return false;
+  }
   if (chIdx >= CHANNEL_COUNT ||
       channels_[chIdx].link.state() != ax25::LinkState::Disconnected ||
       channels_[chIdx].loopbackPeer < CHANNEL_COUNT) return false;
@@ -3790,6 +3841,12 @@ void Tnc::saveSerialMode(SerialMode /*mode*/) {
 }
 
 void Tnc::setSerialMode(SerialMode mode) {
+#if defined(AXLORA_VARIANT_STATION_G2)
+  if (mode != SerialMode::Console && wifiKiss_.active()) {
+    LOG_WARN("USB host taking over from KISS TCP");
+    wifiKiss_.closeClient();
+  }
+#endif
   serialMode_   = mode;
   dedHostMode_  = false;
   if (mode == SerialMode::Wa8ded) {

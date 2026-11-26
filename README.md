@@ -31,6 +31,15 @@ The `radio power` setting is **SX1262 drive power**, not antenna output. The def
 
 Station G2 defaults: 869.4625 MHz, 62.5 kHz bandwidth, SF7 and coding rate 4/5. Previously saved radio settings take precedence; use `radio reset` to restore all variant radio defaults.
 
+Station G2 also supports **Wi-Fi KISS TCP on port 8100**, either joining a
+2.4 GHz network or creating a protected access point. Wi-Fi is off by default.
+Configure `wifi ssid <name>` and `wifi password <value>` over USB, then select
+`wifi sta` or `wifi ap`; `wifi status` shows the IP and free memory.
+Use `wifi off` before changing credentials. Settings survive reset.
+See the [Wi-Fi KISS setup guide](website/guide/kiss.md#station-g2-wi-fi-kiss-tcp)
+for GPNG setup and USB/TCP ownership. Keep port 8100 on a trusted network:
+KISS TCP has no authentication and permits RF transmission.
+
 This is AXLoRaTNC's AX.25-over-LoRa KISS modem, not MeshCore's KISS modem or MeshCore packet protocol. Radio peers must use compatible AXLoRaTNC framing and radio settings.
 
 ## Build from source

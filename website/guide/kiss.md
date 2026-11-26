@@ -26,6 +26,79 @@ On ESP32-S3 boards using native USB (such as the Station G2), dropping DTR while
 - Received AX.25 frames are FCS-checked and emitted as KISS data frames without FCS — exactly as a standard KISS TNC.
 - KISS parameter frames (TxDelay=1, Persistence=2, SlotTime=3, FullDuplex=5) are accepted and drive the CSMA algorithm.
 
+## Station G2: Wi-Fi KISS TCP
+
+Station G2 builds include a raw KISS TCP server on **port 8100**, for use with
+GPNG and other KISS TCP clients. Wi-Fi is off by default. Configure it from the
+USB console; no Wi-Fi credentials belong in the firmware source.
+
+### Join an existing network (2.4 GHz)
+
+```text
+wifi off
+wifi ssid Your network name
+wifi password Your network password
+wifi sta
+wifi status
+```
+
+SSID and password values include everything after the command's space, without
+quotes. Passwords are not echoed or shown in status. Disable local echo in your
+terminal as well. `wifi password clear` permits joining an open network.
+
+Connection is asynchronous: run `wifi status` again after a few seconds to see
+`ready=1` and the DHCP address. Station mode retries after losing Wi-Fi.
+A DHCP reservation on your router keeps the TNC's address stable.
+
+### Standalone access point
+
+```text
+wifi off
+wifi ssid AXLoRa-G2
+wifi password <choose an 8-63 byte password>
+wifi ap
+wifi status
+```
+
+Replace the password placeholder before sending the command. Join that Wi-Fi
+network from the PC; there is no Internet service on the G2 access point. Its
+default address is **192.168.4.1**. SSIDs must be 1-32 bytes; AP passwords must
+be 8-63 bytes. AP and station modes share the configured SSID/password;
+use `wifi off` before changing credentials.
+
+The selected mode and credentials are stored locally in NVS and restored after
+reset. `wifi off` disables Wi-Fi and the TCP listener, also after reset.
+`wifi status` reports free internal heap and PSRAM for runtime memory checks.
+
+### GPNG
+
+Select a **KISS / TCP** connection with:
+
+- Host: the address from `wifi status` (or `192.168.4.1` in AP mode).
+- Port: **8100**.
+- KISS radio port: **0** (the G2 has one radio).
+
+For a single-link GPNG configuration, the equivalent `[tnc]` fields are
+`protocol = "kiss"`, `kiss_transport = "tcp"`, `kiss_tcp_host = "<TNC IP>"`,
+and `kiss_tcp_port = 8100`. If using GPNG's `links` list, configure that link's
+TCP host and port instead. No KISS.INI console entry or DTR pulse is needed.
+
+Only one TCP client is accepted. USB remains a configuration console while TCP
+owns received AX.25 frames; the internal link layer does not answer them.
+USB KISS/WA8DED sessions and active internal connections prevent TCP acceptance.
+Starting a USB host session while TCP is connected closes the TCP client and
+gives USB priority. KISS Return (`C0 FF C0`) over TCP closes only that client;
+it does not change USB mode or Wi-Fi settings. Received frames and parameter
+handling use the same KISS framing as USB, with no text or TX echo on TCP.
+Slow clients are disconnected if the output queue fills or sending stalls for
+three seconds, rather than blocking radio service.
+
+::: warning Trusted local networks only
+KISS TCP has no authentication or encryption. Anyone who can reach port 8100
+can transmit using the TNC. Use a protected Wi-Fi network and do not forward
+this port to the Internet. Wi-Fi does not enable a web interface.
+:::
+
 ## Compatible software
 
 | Application | Notes |
