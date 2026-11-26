@@ -1,6 +1,7 @@
 #include "tnc.h"
 #include <Arduino.h>
 #include <Preferences.h>
+#include <esp_system.h>
 #include <stdlib.h>
 #include <string.h>
 #include "aprs/aprs.h"
@@ -22,6 +23,12 @@
 
 namespace axlora::tnc {
 namespace {
+
+#if defined(AXLORA_VARIANT_STATION_G2)
+static constexpr int FREQUENCY_DECIMALS = 4;
+#else
+static constexpr int FREQUENCY_DECIMALS = 3;
+#endif
 
 static void formatUptime(uint32_t ms, char* buf, size_t cap) {
   const uint32_t s = ms / 1000;
@@ -241,18 +248,21 @@ void Tnc::beginLink(uint8_t chIdx, const ax25::Address& local) {
 }
 
 void Tnc::resetLinksForLocal() {
+  loopbackTxQueue_.clear();
   for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
+    channels_[i].loopbackPeer = CHANNEL_COUNT;
     beginLink(i, local_);
   }
 }
 
 bool Tnc::setChannelLocal(uint8_t chIdx, const ax25::Address& local) {
-  if (chIdx >= CHANNEL_COUNT) return false;
+  if (chIdx >= CHANNEL_COUNT || channels_[chIdx].loopbackPeer < CHANNEL_COUNT) return false;
   return channels_[chIdx].link.setLocalAddress(local);
 }
 
 void Tnc::loop(bool radioReady) {
   serviceSerial();
+  serviceLoopbackTx();
   if (radioReady) {
     if (!radioConfigApplied_) {
       applyRadioConfig();
@@ -285,6 +295,25 @@ bool Tnc::isChannelBusy() const {
 }
 
 bool Tnc::transmitRaw(const uint8_t* data, size_t len, uint8_t chIdx) {
+  if (chIdx < CHANNEL_COUNT && channels_[chIdx].loopbackPeer < CHANNEL_COUNT) {
+    ax25::Frame frame{};
+    if (data != nullptr && len <= MAX_PACKET_BYTES &&
+        ax25::decodeFrame(data, len, frame, true) &&
+        !isUiFrame(frame) &&
+        ax25::addressEquals(frame.destination,
+                            channels_[channels_[chIdx].loopbackPeer].link.local())) {
+      LoopbackTx tx{};
+      memcpy(tx.data, data, len);
+      tx.len = len;
+      tx.source = chIdx;
+      tx.destination = channels_[chIdx].loopbackPeer;
+      if (!loopbackTxQueue_.push(tx)) {
+        LOG_WARN("loopback tx queue full");
+        return false;
+      }
+      return true;
+    }
+  }
   if (!dedTxEnabled_) {
     return false;
   }
@@ -292,6 +321,28 @@ bool Tnc::transmitRaw(const uint8_t* data, size_t len, uint8_t chIdx) {
       ? static_cast<uint32_t>(kissParams_.txDelay) * 10
       : 0;
   return enqueueRawTx(data, len, delayMs, chIdx);
+}
+
+void Tnc::serviceLoopbackTx() {
+  const size_t count = loopbackTxQueue_.size();
+  for (size_t i = 0; i < count; ++i) {
+    LoopbackTx tx{};
+    if (!loopbackTxQueue_.pop(tx)) break;
+    if (channels_[tx.source].loopbackPeer != tx.destination ||
+        channels_[tx.destination].loopbackPeer != tx.source) continue;
+    channels_[tx.source].link.notifyTxSent();
+    channels_[tx.destination].link.receive(tx.data, tx.len);
+  }
+  if (!loopbackTxQueue_.empty()) return;
+  for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
+    const uint8_t peer = channels_[i].loopbackPeer;
+    if (peer < CHANNEL_COUNT &&
+        channels_[i].link.state() == ax25::LinkState::Disconnected &&
+        channels_[peer].link.state() == ax25::LinkState::Disconnected) {
+      channels_[i].loopbackPeer = CHANNEL_COUNT;
+      channels_[peer].loopbackPeer = CHANNEL_COUNT;
+    }
+  }
 }
 
 bool Tnc::enqueueRawTx(const uint8_t* data, size_t len, uint32_t delayMs, uint8_t chIdx) {
@@ -632,6 +683,15 @@ void Tnc::serviceSerial() {
   size_t bytesProcessed = 0;
   uint8_t kissFramesProcessed = 0;
 
+  if (serialMode_ == SerialMode::Wa8ded && dedHostMode_ && dedHeaderPos_ != 0 &&
+      Serial.available() == 0 && static_cast<uint32_t>(millis() - dedLastByteMs_) >= 1000) {
+    dedHeaderPos_ = 0;
+    dedDataPos_ = 0;
+    dedDataLen_ = 0;
+    ++dedRxTimeouts_;
+    LOG_WARN("incomplete WA8DED frame discarded after serial inactivity");
+  }
+
   while (Serial.available() > 0 && bytesProcessed < SERIAL_BYTE_BUDGET) {
     if (serialMode_ == SerialMode::Kiss &&
         rawTxQueue_.free() <= KISS_SERIAL_TXQ_HEADROOM &&
@@ -640,29 +700,45 @@ void Tnc::serviceSerial() {
     }
     const uint8_t b = static_cast<uint8_t>(Serial.read());
     ++bytesProcessed;
+    // A FEND where no WA8DED frame is in progress means a KISS host took over
+    // the port (0xC0 is never a valid WA8DED channel). Enter full KISS mode so
+    // the firmware stops answering AX.25 itself and keeps text off the wire.
+    if (b == ax25::KISS_FEND && serialMode_ != SerialMode::Kiss &&
+        (serialMode_ == SerialMode::Console || !dedHostMode_ || dedHeaderPos_ == 0)) {
+      setSerialMode(SerialMode::Kiss);
+    }
     if (serialMode_ == SerialMode::Wa8ded) {
+      const bool wasHostMode = dedHostMode_;
       serviceWa8ded(b);
-      handleQuietEscape(b);
+      if (!wasHostMode && !dedHostMode_) handleQuietEscape(b);
       continue;
     }
-    ax25::KissFrame frame{};
-    if (serialMode_ == SerialMode::Kiss || b == ax25::KISS_FEND) kissActive_ = true;
-    if (kissActive_) {
+    if (serialMode_ == SerialMode::Kiss) {
+      ax25::KissFrame frame{};
       if (kiss_.feed(b, frame)) {
         handleKiss(frame);
-        if (++kissFramesProcessed >= KISS_FRAME_BUDGET) {
+        if (++kissFramesProcessed >= KISS_FRAME_BUDGET || serialMode_ != SerialMode::Kiss) {
           break;
         }
       }
       continue;
     }
-    if (serialMode_ == SerialMode::Kiss) {
-      handleQuietEscape(b);
+    if (b == 0x11) continue;
+    if (b == 0x18) {
+      linePos_ = 0;
       continue;
     }
     if (b == '\r' || b == '\n') {
       if (linePos_ == 0) continue;
       line_[linePos_] = '\0';
+      if (b == '\r' && strcasecmp(line_, "\x1b" "JHOST1") == 0) {
+        setSerialMode(SerialMode::Wa8ded);
+        const char entry[] = "\x1b" "JHOST1\r";
+        for (size_t i = 0; i < sizeof(entry) - 1; ++i) {
+          serviceWa8dedTerminal(static_cast<uint8_t>(entry[i]));
+        }
+        continue;
+      }
       Serial.print("\r\n");
       handleConsoleLine(line_);
       linePos_ = 0;
@@ -685,6 +761,11 @@ void Tnc::serviceSerial() {
 }
 
 void Tnc::handleKiss(const ax25::KissFrame& frame) {
+  // TAPR KISS "Return" (C0 FF C0): leave KISS for the command console.
+  if (frame.port == 0x0F && static_cast<uint8_t>(frame.command) == 0x0F) {
+    setSerialMode(SerialMode::Console);
+    return;
+  }
   ++kissInFrames_;
   kissInBytes_ += static_cast<uint32_t>(frame.len + 1);
   LINFBB_TRACE("KISS_IN n=%lu port=%u cmd=%u len=%u first=%02X %02X %02X %02X",
@@ -793,6 +874,19 @@ void Tnc::handleConsoleLine(char* line) {
   char* cmd = strtok(line, " ");
   if (cmd == nullptr) return;
 
+  if (strcasecmp(cmd, "kiss") == 0) {
+    // TAPR / Kenwood style "KISS ON" (as sent by KISSINIT-style KISS.INI files).
+    char* arg = strtok(nullptr, " ");
+    if (arg != nullptr && strcasecmp(arg, "on") == 0) {
+      Serial.flush();
+      setSerialMode(SerialMode::Kiss);
+    } else {
+      Serial.println("usage: KISS ON");
+    }
+    return;
+  }
+  if (strcasecmp(cmd, "restart") == 0) return;
+
   if (strcmp(cmd, "help") == 0) {
     Serial.println("Commands: help info callsign mode baud stats bbs");
     Serial.println("          radio [freq|corr|sf|bw|cr|power|reset] [val]");
@@ -803,6 +897,7 @@ void Tnc::handleConsoleLine(char* line) {
     Serial.println("          beacon [on|off|now|text|dest|interval|path]");
     Serial.println("          mheard [clear] digi [on|off|mode ui|all] digialias [CALL|off]");
     Serial.println("          node [on|off|alias|ident|interval|broadcast] nodes routes");
+    Serial.println("          KISS ON (enter KISS; KISS frame C0 FF C0 returns here)");
 
   } else if (strcmp(cmd, "info") == 0) {
     printInfo();
@@ -881,8 +976,8 @@ void Tnc::handleConsoleLine(char* line) {
   } else if (strcmp(cmd, "radio") == 0) {
     char* sub = strtok(nullptr, " ");
     if (sub == nullptr) {
-      Serial.printf("freq=%.3f corr=%+.1f kHz bw=%.1f sf=%u cr=4/%u pwr=%d RSSI=%.1f SNR=%.1f\n",
-                    static_cast<double>(radioConfig_.frequencyMHz),
+      Serial.printf("freq=%.*f corr=%+.1f kHz bw=%.1f sf=%u cr=4/%u pwr=%d RSSI=%.1f SNR=%.1f\n",
+                    FREQUENCY_DECIMALS, static_cast<double>(radioConfig_.frequencyMHz),
                     static_cast<double>(radioConfig_.frequencyCorrectionMHz * 1000.0f),
                     static_cast<double>(radioConfig_.bandwidthKhz),
                     radioConfig_.spreadingFactor, radioConfig_.codingRate,
@@ -899,8 +994,8 @@ void Tnc::handleConsoleLine(char* line) {
       applyRadioConfig();
       radioConfigApplied_ = true;
       saveRadioConfig();
-      Serial.printf("radio reset freq=%.3f corr=%+.1f kHz bw=%.1f sf=%u cr=4/%u pwr=%d\n",
-                    static_cast<double>(radioConfig_.frequencyMHz),
+      Serial.printf("radio reset freq=%.*f corr=%+.1f kHz bw=%.1f sf=%u cr=4/%u pwr=%d\n",
+                    FREQUENCY_DECIMALS, static_cast<double>(radioConfig_.frequencyMHz),
                     static_cast<double>(radioConfig_.frequencyCorrectionMHz * 1000.0f),
                     static_cast<double>(radioConfig_.bandwidthKhz),
                     radioConfig_.spreadingFactor, radioConfig_.codingRate,
@@ -912,7 +1007,7 @@ void Tnc::handleConsoleLine(char* line) {
         radioConfig_.frequencyMHz = static_cast<float>(atof(val));
         radio::driver().setFrequency(radioConfig_.frequencyMHz);
         saveRadioConfig();
-        Serial.printf("freq=%.3f MHz\n", static_cast<double>(radioConfig_.frequencyMHz));
+        Serial.printf("freq=%.*f MHz\n", FREQUENCY_DECIMALS, static_cast<double>(radioConfig_.frequencyMHz));
       }
     } else if (strcmp(sub, "corr") == 0 || strcmp(sub, "correction") == 0 || strcmp(sub, "offset") == 0) {
       char* val = strtok(nullptr, " ");
@@ -964,6 +1059,19 @@ void Tnc::handleConsoleLine(char* line) {
       }
     } else if (strcmp(sub, "power") == 0 || strcmp(sub, "pwr") == 0) {
       char* val = strtok(nullptr, " ");
+#if defined(AXLORA_VARIANT_STATION_G2)
+      char* end = nullptr;
+      const long power = val ? strtol(val, &end, 10) : 0;
+      if (!val || end == val || *end != '\0' || power < -9 || power > variant::MAX_TX_POWER_DBM) {
+        Serial.printf("usage: radio power <-9..%d> (SX1262 dBm)\n", variant::MAX_TX_POWER_DBM);
+      } else if (radio::driver().setPower(static_cast<int8_t>(power)) != radio::Result::Ok) {
+        Serial.println("radio power failed");
+      } else {
+        radioConfig_.powerDbm = static_cast<int8_t>(power);
+        saveRadioConfig();
+        Serial.printf("pwr=%d dBm (SX1262)\n", radioConfig_.powerDbm);
+      }
+#else
       if (!val) { Serial.println("usage: radio power <dBm>"); }
       else {
         radioConfig_.powerDbm = static_cast<int8_t>(atol(val));
@@ -971,6 +1079,7 @@ void Tnc::handleConsoleLine(char* line) {
         saveRadioConfig();
         Serial.printf("pwr=%d dBm\n", radioConfig_.powerDbm);
       }
+#endif
     } else {
       Serial.println("usage: radio [freq|corr|sf|bw|cr|power|reset] [value]");
     }
@@ -1270,14 +1379,14 @@ void Tnc::printInfo() const {
   Serial.printf("AXLoRaTNC local=%s variant=%s radio=%s\n",
                 local, variant::NAME,
                 variant::RADIO_TYPE == variant::RadioType::SX1262 ? "SX1262" : "SX1276");
-  Serial.printf("  freq=%.3f MHz bw=%.1f kHz sf=%u cr=4/%u pwr=%d dBm\n",
-                static_cast<double>(radioConfig_.frequencyMHz),
+  Serial.printf("  freq=%.*f MHz bw=%.1f kHz sf=%u cr=4/%u pwr=%d dBm\n",
+                FREQUENCY_DECIMALS, static_cast<double>(radioConfig_.frequencyMHz),
                 static_cast<double>(radioConfig_.bandwidthKhz),
                 radioConfig_.spreadingFactor, radioConfig_.codingRate,
                 radioConfig_.powerDbm);
-  Serial.printf("  freq_corr=%+.1f kHz tuned=%.3f MHz\n",
+  Serial.printf("  freq_corr=%+.1f kHz tuned=%.*f MHz\n",
                 static_cast<double>(radioConfig_.frequencyCorrectionMHz * 1000.0f),
-                static_cast<double>(radioConfig_.frequencyMHz + radioConfig_.frequencyCorrectionMHz));
+                FREQUENCY_DECIMALS, static_cast<double>(radioConfig_.frequencyMHz + radioConfig_.frequencyCorrectionMHz));
   Serial.printf("  duty=%s %.3f%%\n", dutyCycleEnabled_ ? "on" : "off",
                 static_cast<double>(dutyCyclePpm_) / 10000.0);
   Serial.printf("serial mode=%s channels=%u baud_kiss=%lu baud_ded=%lu\n",
@@ -1374,7 +1483,29 @@ void Tnc::printStats() const {
 bool Tnc::connect(uint8_t chIdx, const char* destination) {
   if (chIdx >= CHANNEL_COUNT || destination == nullptr) return false;
   ax25::Address dest{};
-  return ax25::parseAddress(destination, dest) && channels_[chIdx].link.connectTo(dest);
+  return ax25::parseAddress(destination, dest) && connectChannel(chIdx, dest);
+}
+
+bool Tnc::connectChannel(uint8_t chIdx, const ax25::Address& destination) {
+  if (chIdx >= CHANNEL_COUNT ||
+      channels_[chIdx].link.state() != ax25::LinkState::Disconnected ||
+      channels_[chIdx].loopbackPeer < CHANNEL_COUNT) return false;
+  bool localDestination = false;
+  for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
+    if (!ax25::addressEquals(channels_[i].link.local(), destination)) continue;
+    localDestination = true;
+    if (i == chIdx || channels_[i].link.state() != ax25::LinkState::Disconnected ||
+        channels_[i].loopbackPeer < CHANNEL_COUNT) continue;
+    channels_[chIdx].loopbackPeer = i;
+    channels_[i].loopbackPeer = chIdx;
+    if (channels_[chIdx].link.connectTo(destination)) return true;
+    channels_[chIdx].loopbackPeer = CHANNEL_COUNT;
+    channels_[i].loopbackPeer = CHANNEL_COUNT;
+    beginLink(chIdx, channels_[chIdx].link.local());
+    return false;
+  }
+  // A local callsign must never fall through to an RF connection when busy.
+  return !localDestination && channels_[chIdx].link.connectTo(destination);
 }
 
 bool Tnc::disconnect(uint8_t chIdx) {
@@ -1747,6 +1878,21 @@ void Tnc::serviceWa8ded(uint8_t byte) {
 }
 
 void Tnc::serviceWa8dedHost(uint8_t byte) {
+  dedLastByteMs_ = millis();
+  // CAN/ESC resynchronization is only safe where a channel byte is expected.
+  if (dedHeaderPos_ == 0) {
+    if (byte == 0x18) return;
+    if (byte == 0x1B) {
+      dedHostMode_ = false;
+      dedDataPos_ = 0;
+      dedDataLen_ = 0;
+      linePos_ = 0;
+      dedTerminalCommand_ = false;
+      dedOutputPaused_ = false;
+      serviceWa8dedTerminal(byte);
+      return;
+    }
+  }
   // XON/XOFF only safe to intercept at frame boundary (channel bytes 0x11/0x13 are out of range)
   if (dedXonXoff_ && dedHeaderPos_ == 0) {
     if (byte == 0x13) { dedOutputPaused_ = true;  return; }
@@ -2432,6 +2578,10 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
     cmd[--cmdLen] = '\0';
 
   if (cmd[0] == 'G') {
+    if (channel == 255) {
+      sendDedText(channel, 2, "EXTENDED POLL NOT SUPPORTED");
+      return;
+    }
     // G / G0 / G1 polling; honour XON/XOFF pause for monitor/data events
     const uint8_t wanted = cmd[1] == '0' ? 7 : (cmd[1] == '1' ? 3 : 0);
     // While paused only deliver high-priority link-status events (code 3), not data/monitor
@@ -2487,7 +2637,7 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
     if (channel >= 1 && channel <= CHANNEL_COUNT) {
       ax25::Address connectDest{};
       if (parseDedConnectAddress(dest, connectDest) &&
-          channels_[channel - 1].link.connectTo(connectDest)) {
+          connectChannel(channel - 1, connectDest)) {
         copyFormattedAddress(connectDest, dedLastConnect_, sizeof(dedLastConnect_));
         dedLastConnectChannel_ = channel;
         sendDedShort(channel, 0);
@@ -2552,13 +2702,16 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
 
   if (cmd[0] == 'L') {
     if (channel == 0) {
-      // Channel 0 is the UI/unconnected channel — no RF state to report.
-      sendDedText(0, 1, "0 0 0 0 0 0 -");
+      char status[32]{};
+      snprintf(status, sizeof(status), "%u %u",
+               static_cast<unsigned>(pendingDedEvents(0, 4) + pendingDedEvents(0, 5)),
+               static_cast<unsigned>(pendingDedEvents(0, 6)));
+      sendDedText(0, 1, status);
       return;
     }
     const uint8_t chIdx = channel - 1;
     if (chIdx >= CHANNEL_COUNT) {
-      sendDedText(channel, 1, "0 0 0 0 0 0 -");
+      sendDedText(channel, 2, "INVALID CHANNEL");
       return;
     }
     const ax25::LinkState linkState = channels_[chIdx].link.state();
@@ -2567,25 +2720,61 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
     // session dropped before the retry limit has been exhausted.
     const bool connected = (linkState == ax25::LinkState::Connected ||
                             linkState == ax25::LinkState::Recovery);
-    char peer[12]{};
-    ax25::formatAddress(channels_[chIdx].link.peer(), peer, sizeof(peer));
-    const size_t pending = pendingDedEvents(channel, 0);
     char status[80]{};
-    // Six numeric fields keep classic WA8DED/TF host clients happy:
-    // rx-wait tx-wait outstanding queued retries connected [peer].
-    snprintf(status, sizeof(status), "%u 0 %u %u %u %u %s",
-             pending > 255 ? 255U : static_cast<unsigned>(pending),
-             static_cast<unsigned>(channels_[chIdx].link.outstandingFrameCount()),
+    // WA8DED: status pending, RX pending, TX queued, unacknowledged, retries, connected.
+    snprintf(status, sizeof(status), "%u %u %u %u %u %u",
+             static_cast<unsigned>(pendingDedEvents(channel, 3)),
+             static_cast<unsigned>(pendingDedEvents(channel, 7)),
              static_cast<unsigned>(channels_[chIdx].link.connectedQueueSize()),
+             static_cast<unsigned>(channels_[chIdx].link.outstandingFrameCount()),
              static_cast<unsigned>(channels_[chIdx].link.retryCount()),
-             connected ? 1U : 0U,
-             connected ? peer : "-");
+             connected ? 1U : 0U);
     sendDedText(channel, 1, status);
     return;
   }
 
   if (cmd[0] == '@') {
     const char* token = cmd + 1;
+    if (token[0] == 'V') {
+      const char* arg = skipSpaces(token + 1);
+      if (*arg == '\0') {
+        char text[8]{};
+        snprintf(text, sizeof(text), "@V %u", dedValidateCallsign_ ? 1U : 0U);
+        sendDedText(channel, 1, text);
+      } else {
+        char* end = nullptr;
+        const long value = strtol(arg, &end, 10);
+        if (end == arg || *end != '\0' || value < 0 || value > 1) {
+          sendDedText(channel, 2, "INVALID PARAMETER");
+          return;
+        }
+        dedValidateCallsign_ = value != 0;
+        saveDedConfig();
+        sendDedShort(channel, 0);
+      }
+      return;
+    }
+    if (token[0] == 'T' && (token[1] == '2' || token[1] == '3')) {
+      const char* arg = skipSpaces(token + 2);
+      uint16_t& value = token[1] == '2' ? dedT2_ : dedT3_;
+      if (*arg == '\0') {
+        char text[16]{};
+        snprintf(text, sizeof(text), "@T%c %u", token[1], static_cast<unsigned>(value));
+        sendDedText(channel, 1, text);
+      } else {
+        char* end = nullptr;
+        const long parsed = strtol(arg, &end, 10);
+        if (end == arg || *end != '\0' || parsed < 0 || parsed > 65535) {
+          sendDedText(channel, 2, "INVALID PARAMETER");
+          return;
+        }
+        value = static_cast<uint16_t>(parsed);
+        applyDedLinkConfig();
+        saveDedConfig();
+        sendDedShort(channel, 0);
+      }
+      return;
+    }
     if (token[0] == 'B' && (token[1] == '\0' || token[1] == ' ')) {
       char text[8]{};
       const unsigned freeBytes = dedFreeBufferBytes(channel);
@@ -2614,7 +2803,22 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
     // @D — diagnostic dump: per-channel L2 state + radio counters
     if (token[0] == 'D' && (token[1] == '\0' || token[1] == ' ')) {
       char buf[256]{};
-      size_t pos = 0;
+      const auto& rs = radio::stats();
+      size_t pos = snprintf(buf, sizeof(buf),
+                            "radio rxOk=%lu rxFail=%lu txOk=%lu txFail=%lu rssi=%.0f snr=%.0f\n"
+                            "uptime_ms=%lu reset=%u outFail=%lu rxTimeout=%lu block_ms=%lu\n",
+                            static_cast<unsigned long>(rs.rxOk),
+                            static_cast<unsigned long>(rs.rxFail),
+                            static_cast<unsigned long>(rs.txOk),
+                            static_cast<unsigned long>(rs.txFail),
+                            static_cast<double>(lastRssi_),
+                            static_cast<double>(lastSnr_),
+                            static_cast<unsigned long>(millis()),
+                            static_cast<unsigned>(esp_reset_reason()),
+                            static_cast<unsigned long>(dedOutPartialWrites_),
+                            static_cast<unsigned long>(dedRxTimeouts_),
+                            static_cast<unsigned long>(dedOutBlockMsMax_));
+      if (pos >= sizeof(buf)) pos = sizeof(buf) - 1;
       for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) {
         const ax25::LinkLayer& lnk = channels_[i].link;
         if (lnk.state() == ax25::LinkState::Disconnected) continue;
@@ -2624,21 +2828,17 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
                          lnk.state() == ax25::LinkState::Connecting    ? "CONN" :
                          lnk.state() == ax25::LinkState::Recovery      ? "REC" :
                          lnk.state() == ax25::LinkState::Disconnecting ? "DISC" : "?";
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        "ch%u %s %s ret=%u\n",
-                        static_cast<unsigned>(i + 1), st, peer,
-                        static_cast<unsigned>(lnk.retryCount()));
-        if (pos >= sizeof(buf) - 1) break;
+        const size_t remaining = sizeof(buf) - pos;
+        const int written = snprintf(buf + pos, remaining, "ch%u %s %s ret=%u\n",
+                                     static_cast<unsigned>(i + 1), st, peer,
+                                     static_cast<unsigned>(lnk.retryCount()));
+        if (written < 0) {
+          LOG_ERR("WA8DED diagnostic formatting failed");
+          break;
+        }
+        if (static_cast<size_t>(written) >= remaining) break;
+        pos += static_cast<size_t>(written);
       }
-      const auto& rs = radio::stats();
-      pos += snprintf(buf + pos, sizeof(buf) - pos,
-                      "radio rxOk=%lu rxFail=%lu txOk=%lu txFail=%lu rssi=%.0f snr=%.0f",
-                      static_cast<unsigned long>(rs.rxOk),
-                      static_cast<unsigned long>(rs.rxFail),
-                      static_cast<unsigned long>(rs.txOk),
-                      static_cast<unsigned long>(rs.txFail),
-                      static_cast<double>(lastRssi_),
-                      static_cast<double>(lastSnr_));
       sendDedText(channel, 1, buf);
       return;
     }
@@ -2779,22 +2979,43 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
 
 void Tnc::sendDedShort(uint8_t channel, uint8_t code) {
   uint8_t out[2] = {channel, code};
-  Serial.write(out, sizeof(out));
+  writeDedReply(out, sizeof(out));
+}
+
+void Tnc::writeDedReply(const uint8_t* data, size_t len) {
+  const uint32_t startMs = millis();
+  const bool complete = serialWriteAll(data, len);
+  if (complete) Serial.flush();
+  const uint32_t elapsedMs = millis() - startMs;
+  if (elapsedMs > dedOutBlockMsMax_) dedOutBlockMsMax_ = elapsedMs;
+  if (!complete) {
+    ++dedOutPartialWrites_;
+    LOG_ERR("serial WA8DED write timeout len=%u", static_cast<unsigned>(len));
+  }
 }
 
 void Tnc::sendDedText(uint8_t channel, uint8_t code, const char* text) {
-  Serial.write(channel);
-  Serial.write(code);
-  if (text != nullptr) Serial.write(reinterpret_cast<const uint8_t*>(text), strlen(text));
-  Serial.write(static_cast<uint8_t>(0));
+  const size_t len = text != nullptr ? strlen(text) : 0;
+  uint8_t out[259]{};
+  if (len > sizeof(out) - 3) {
+    LOG_ERR("serial WA8DED text reply too long len=%u", static_cast<unsigned>(len));
+    sendDedText(channel, 2, "REPLY TOO LONG");
+    return;
+  }
+  out[0] = channel;
+  out[1] = code;
+  if (len > 0) memcpy(out + 2, text, len);
+  writeDedReply(out, len + 3);
 }
 
 void Tnc::sendDedCounted(uint8_t channel, uint8_t code, const uint8_t* data, size_t len) {
   const size_t capped = len > 256 ? 256 : len;
-  Serial.write(channel);
-  Serial.write(code);
-  Serial.write(static_cast<uint8_t>(capped == 0 ? 0 : capped - 1));
-  if (capped > 0) Serial.write(data, capped);
+  uint8_t out[259]{};
+  out[0] = channel;
+  out[1] = code;
+  out[2] = static_cast<uint8_t>(capped == 0 ? 0 : capped - 1);
+  if (capped > 0) memcpy(out + 3, data, capped);
+  writeDedReply(out, capped + 3);
 }
 
 unsigned Tnc::dedFreeBufferBytes(uint8_t channel) const {
@@ -3447,6 +3668,12 @@ void Tnc::loadSettings() {
     if (!isValidBaud(baudDed_))  baudDed_  = 9600U;
     prefs.end();
   }
+#if defined(AXLORA_VARIANT_STATION_G2)
+  if (radioConfig_.powerDbm < -9 || radioConfig_.powerDbm > variant::MAX_TX_POWER_DBM) {
+    LOG_WARN("saved radio power outside Station G2 limits; using default");
+    radioConfig_.powerDbm = variant::DEFAULT_TX_POWER_DBM;
+  }
+#endif
   if (serialMode_ != SerialMode::Console &&
       serialMode_ != SerialMode::Kiss &&
       serialMode_ != SerialMode::Wa8ded) {
@@ -3549,8 +3776,8 @@ void Tnc::applyRadioConfig() {
   drv.setBandwidth(radioConfig_.bandwidthKhz);
   drv.setCodingRate(radioConfig_.codingRate);
   drv.setPower(radioConfig_.powerDbm);
-  LOG_RADIO("radio config applied: freq=%.3f corr=%+.1fkHz sf=%u bw=%.1f cr=%u pwr=%d",
-            static_cast<double>(radioConfig_.frequencyMHz),
+  LOG_RADIO("radio config applied: freq=%.*f corr=%+.1fkHz sf=%u bw=%.1f cr=%u pwr=%d",
+            FREQUENCY_DECIMALS, static_cast<double>(radioConfig_.frequencyMHz),
             static_cast<double>(radioConfig_.frequencyCorrectionMHz * 1000.0f),
             radioConfig_.spreadingFactor,
             static_cast<double>(radioConfig_.bandwidthKhz),
@@ -3576,7 +3803,7 @@ void Tnc::setSerialMode(SerialMode mode) {
     dedIPollFrameLength_ = 128;
     applyDedLinkConfig();
   }
-  kissActive_   = false;
+  kiss_.reset();
   linePos_      = 0;
   escapePos_    = 0;
   dedTerminalCommand_ = false;

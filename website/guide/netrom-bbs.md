@@ -55,7 +55,7 @@ bbs        # list all messages regardless of recipient
 
 ```text
 connect N0CALL-1           # connect on channel 1
-connect 2 N0CALL-2         # connect on channel 2 (1–8)
+connect 2 N0CALL-2         # connect on channel 2 (1–8; Station G2: 1–10)
 disconnect                 # disconnect channel 1
 disconnect 2               # disconnect channel 2
 send hello                 # send on channel 1

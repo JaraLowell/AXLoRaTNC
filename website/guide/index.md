@@ -9,6 +9,9 @@
 | TTGO T-Beam | ESP32 | SX1276 | `tbeam` | ⚠ not tested |
 | LilyGo T3 LoRa32 V1.6.1 | ESP32 | SX1276 | `lilygo_t3_v161` | ✅ tested |
 | LILYGO T-Beam SUPREME 433MHz | ESP32-S3 | SX1262 | `tbeam_supreme_433` | ⚠ not tested |
+| BQ Station G2 | ESP32-S3 | SX1262 + PA | `station_g2` | ⚠ not tested |
+
+For Station G2, `radio power` is the SX1262 drive level, **not** the amplified output. The 7 dBm default produces approximately 27 dBm at 915 MHz or 28 dBm at 868 MHz; output can reach several watts. Check the [manufacturer's measurements](https://wiki.bqvoy.com/en/meshtastic/station-g2), use a suitable load and comply with local frequency, power and duty-cycle limits. The radio defaults are 869.4625 MHz, 62.5 kHz bandwidth, SF7 and coding rate 4/5. Saved settings take precedence; `radio reset` restores all radio defaults. This firmware uses AXLoRaTNC AX.25-over-LoRa framing, not MeshCore's radio protocol.
 
 ---
 
@@ -77,7 +80,7 @@ Switch to KISS mode when connecting a host application:
 mode kiss
 ```
 
-Type `console` (plain text, followed by Enter) at any time to return to the interactive console.
+Serial mode changes are not persisted. Reboot to return to the console from KISS mode, and issue `mode kiss` again before reconnecting the KISS host.
 
 ---
 

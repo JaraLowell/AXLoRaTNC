@@ -34,6 +34,11 @@ VARIANTS = {
         "name": "LILYGO T-Beam SUPREME 433MHz (SX1262)",
         "bootloader_offset": 0x0,
     },
+    "station_g2": {
+        "chip": "ESP32-S3",
+        "name": "BQ Station G2 (SX1262)",
+        "bootloader_offset": 0x0,
+    },
 }
 
 

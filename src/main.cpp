@@ -30,8 +30,14 @@ void serviceRadioInit(bool force) {
 }
 
 void setup() {
+  const size_t serialRxBufferSize = Serial.setRxBufferSize(512);
   Serial.begin(axlora::variant::SERIAL_BAUD);
-  pinMode(axlora::variant::PIN_LED_TX, OUTPUT);
+  if (serialRxBufferSize != 512) {
+    LOG_ERR("serial RX buffer allocation failed: %u", static_cast<unsigned>(serialRxBufferSize));
+  }
+  if (axlora::variant::PIN_LED_TX >= 0) {
+    pinMode(axlora::variant::PIN_LED_TX, OUTPUT);
+  }
   if (axlora::variant::PIN_LED_RX >= 0) {
     pinMode(axlora::variant::PIN_LED_RX, OUTPUT);
   }

@@ -19,6 +19,19 @@ Use the browser-based installer — no drivers or tools needed. Works in Chrome 
 | TTGO T-Beam | ESP32 | SX1276 | `tbeam` | ⚠ not tested |
 | LilyGo T3 LoRa32 V1.6.1 | ESP32 | SX1276 | `lilygo_t3_v161` | ✅ tested |
 | LILYGO T-Beam SUPREME 433MHz | ESP32-S3 | SX1262 | `tbeam_supreme_433` | ⚠ not tested |
+| BQ Station G2 | ESP32-S3 | SX1262 + PA | `station_g2` | ⚠ not tested |
+
+### Station G2
+
+Build with `pio run -e station_g2` and flash with `pio run -e station_g2 --target upload`.
+The pinout, TCXO, RF switch and amplifier drive limit follow [MeshCore's Station G2 configuration](https://github.com/meshcore-dev/MeshCore/blob/main/variants/station_g2/platformio.ini).
+Connect the native USB port, configure the radio and callsign in the console, then enter `mode kiss` before connecting a KISS host. The firmware starts in console mode again after reset.
+
+The `radio power` setting is **SX1262 drive power**, not antenna output. The default 7 dBm drive produces approximately 27 dBm at 915 MHz or 28 dBm at 868 MHz; the amplifier can output several watts. Drive is limited to 19 dBm. These are typical figures, not guaranteed limits: consult the [manufacturer's measurements and operating guidance](https://wiki.bqvoy.com/en/meshtastic/station-g2), use a suitable antenna or rated dummy load, and select frequency, power and duty cycle permitted in your region before transmitting.
+
+Station G2 defaults: 869.4625 MHz, 62.5 kHz bandwidth, SF7 and coding rate 4/5. Previously saved radio settings take precedence; use `radio reset` to restore all variant radio defaults.
+
+This is AXLoRaTNC's AX.25-over-LoRa KISS modem, not MeshCore's KISS modem or MeshCore packet protocol. Radio peers must use compatible AXLoRaTNC framing and radio settings.
 
 ## Build from source
 
@@ -36,7 +49,7 @@ Build and flash:
 ```sh
 ./venv/bin/pio run -e devkitv1_e22                        # build only
 ./venv/bin/pio run -e devkitv1_e22 --target upload        # build + flash
-./venv/bin/pio device monitor -b 115200                   # serial monitor
+./venv/bin/pio device monitor -b 9600                     # serial monitor
 ```
 
 ## LoRa defaults
@@ -45,12 +58,12 @@ The `devkitv1_e22` defaults are stored in `variants/devkitv1_e22/`. They can be 
 
 | Parameter | Default |
 |---|---|
-| Frequency | 869.480 MHz |
-| Bandwidth | 125 kHz |
+| Frequency | 869.4625 MHz |
+| Bandwidth | 62.5 kHz |
 | Spreading factor | SF7 |
 | Coding rate | 4/5 |
 | Sync word | 0x12 |
-| TX power | 22 dBm |
+| TX power | 12 dBm |
 | AX.25 FCS | inside LoRa payload |
 | RadioLib packet CRC | enabled |
 
@@ -97,8 +110,8 @@ Use `profile fast` only on a dummy load or shielded lab setup.
 ### AX.25 connected mode
 
 ```text
-connect N0CALL-1           → connect on channel 1
-connect 2 N0CALL-2         → connect on channel 2 (1–8)
+connect N0CALL-1          → connect on channel 1
+connect 2 N0CALL-2        → connect on channel 2 (1–8; Station G2: 1–10)
 disconnect                → disconnect channel 1
 disconnect 2              → disconnect channel 2
 send hello                → send on channel 1
@@ -207,7 +220,9 @@ mode kiss         → switch to pure KISS
 mode ded          → switch to WA8DED hostmode
 ```
 
-The mode is stored in NVS. In KISS and WA8DED modes, type `console` (plain text) to recover the console.
+Serial mode changes are not persisted. A KISS host's first FEND (`0xC0`) or `KISS ON` enters KISS automatically; the KISS Return frame `C0 FF C0` goes back to the console.
+WA8DED clients can enter hostmode directly from the console with `ESC JHOST1 CR`.
+On UART connections, the host must initially use the console baud rate (115200).
 
 ### Duty Cycle
 
@@ -248,7 +263,11 @@ host → tnc:  [channel] [cmd] [count] [data…]
 tnc  → host: [channel] [code] [data…]
 ```
 
-**8 connected channels** (1–8). Channel 0 = UI/unproto.
+**8 connected channels** (1–8), or **10 on Station G2** (1–10). Channel 0 = UI/unproto.
+
+Connecting to a configured local callsign uses internal channel-to-channel
+loopback through the first free matching channel, without RF transmission.
+See [local loopback](website/guide/wa8ded.md#local-loopback) for examples.
 
 ### Commands
 
@@ -258,10 +277,10 @@ tnc  → host: [channel] [code] [data…]
 | `C <CALL>` | Connect on channel n |
 | `D` | Disconnect channel n |
 | `I [CALL]` | Query / set own callsign |
-| `L` | Channel link status (connected, queue, retries, peer) |
+| `L` | Numeric status/buffer counters: 2 on channel 0, 6 on connected channels |
 | `M [string]` | Query / set monitor mode (`I`/`U`/`S` letters, `N` = off) |
 | `V` | Firmware version string |
-| `S [n]` | Query / select channel (0–8) |
+| `S [n]` | Query / select channel (0–8; Station G2: 0–10) |
 | `U [n]` | Unattended mode (0 = off, 1/2 = on with auto-text) |
 | `JHOST0` | Return to terminal mode |
 | `JHOST1` | Enter binary hostmode (acknowledged) |
@@ -366,7 +385,7 @@ RadioLib is isolated under `src/radio/`. The AX.25 stack under `src/ax25/` has n
 - TX queue per channel (depth 6); data sent from queue after ack
 
 **TNC**
-- 8 independent connected channels
+- 8 independent connected channels (10 on Station G2)
 - CSMA p-persistent listen-before-talk (TxDelay, Persistence, SlotTime, FullDuplex from KISS)
 - Interrupt-driven RX on SX1262 DIO1 pin
 - Duty-cycle enforcement (configurable ppm limit)
@@ -378,9 +397,9 @@ RadioLib is isolated under `src/radio/`. The AX.25 stack under `src/ax25/` has n
 - NET/ROM NODES broadcast, route table (20 entries), route expiry
 - Connected node shell: INFO, NODES, ROUTES, MHEARD, BBS, BYE
 - NVS mailbox BBS: L, LT, R, S, K, X, B commands; timestamps
-- Callsign, radio config, serial mode, beacon, digi, node, BBS all persistent in NVS
+- Callsign, radio config, beacon, digi, node, BBS persistent in NVS
 
 **Serial interfaces**
 - Console (human-readable, all commands)
 - KISS (compatible with all standard KISS software)
-- WA8DED hostmode: 8 channels, full command set (G/C/D/I/L/M/S/U/V/JHOST + A/B/E/F/K/N/O/P/R/T/W/X/Y/Z parameters + @B/@Q), event codes 0–7, monitor mode with frame-type filter (I/U/S), PACLEN fragmentation, XON/XOFF and hardware flow control, FRMR handling, NVS-persistent parameters, compatible with F6FBB, TFPCX, WinPack, BPQ32, JNOS
+- WA8DED hostmode: 8 channels (10 on Station G2), full command set (G/C/D/I/L/M/S/U/V/JHOST + A/B/E/F/K/N/O/P/R/T/W/X/Y/Z parameters + @B/@Q), event codes 0–7, monitor mode with frame-type filter (I/U/S), PACLEN fragmentation, XON/XOFF and hardware flow control, FRMR handling, NVS-persistent parameters, compatible with F6FBB, TFPCX, WinPack, BPQ32, JNOS

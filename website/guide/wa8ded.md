@@ -6,13 +6,25 @@ see the [FBB KISS guide](/guide/fbb-kiss).
 
 ## Enable hostmode
 
-From the console:
+Clients can enter hostmode directly from the console by sending
+`ESC JHOST1 CR`. Alternatively, switch to WA8DED terminal mode manually:
 
 ```text
 mode ded
 ```
 
-The mode is stored in NVS and persists across reboots. To return to the interactive console from any mode, send the plain text string `console` followed by Enter (CR).
+For UART connections, auto-entry must arrive at the console baud rate (115200);
+set `baud ded 115200` in the console if the client cannot change baud after
+entry. USB CDC does not have this physical baud-rate limitation.
+
+Serial mode changes are not persisted. In WA8DED terminal mode, send
+`ESC CONSOLE CR` to return to the interactive console, or reboot.
+Extended polling on channel 255 is not supported; clients should fall back
+to polling individual channels.
+
+For reconnects while binary hostmode is still active, `CAN ESC JHOST1 CR`
+resynchronizes at a frame boundary. CAN and ESC inside counted frame payloads
+remain data and do not change the serial mode.
 
 ## Frame format
 
@@ -21,7 +33,7 @@ host → tnc:  [channel] [cmd] [count] [data…]
 tnc  → host: [channel] [code] [data…]
 ```
 
-- **channel**: 1–8 for connected channels, 0 for UI/unproto
+- **channel**: 1–8 for connected channels (1–10 on Station G2), 0 for UI/unproto
 - **cmd**: 0 = info/data frame; 1 = command frame
 - **count**: number of data bytes minus 1 (data frames); for command frames this is the command length
 - **code**: 0 = ack/no event; 1 = info text; 2 = error; 3 = link status; 4 = monitor header; 5 = monitor frame; 6 = connected data; 7 = UI data
@@ -31,7 +43,25 @@ tnc  → host: [channel] [code] [data…]
 | Range | Purpose |
 |---|---|
 | 0 | UI / unproto (broadcast) |
-| 1–8 | Connected AX.25 channels |
+| 1–8 (Station G2: 1–10) | Connected AX.25 channels |
+
+Station G2 supports all ten connected channels configured by GPNG by default.
+Other variants retain eight channels to fit their RAM limits.
+
+### Local loopback
+
+Connecting to a callsign configured on a local channel pairs the outgoing
+channel with the first free matching channel (lowest channel number first).
+The normal AX.25 connection, data, acknowledgement, and disconnect exchanges
+stay internal: no RF transmission, TX delay, or duty-cycle waiting is involved.
+Loopback also works with RF transmission disabled (`X0`). If all matching
+channels are busy, the connection fails rather than transmitting to yourself.
+
+For example, with `I NL0MSK` configured on all channels, sending `C NL0MSK`
+on channel 1 connects it to channel 2. Both channels report their connection
+through normal hostmode events, and data sent on either appears on the other.
+An SSID such as `NL0MSK-11` works only if a local channel is explicitly
+configured with that identity; it is not an automatic internal-BBS endpoint.
 
 ## Commands (hostmode)
 
@@ -46,12 +76,29 @@ tnc  → host: [channel] [code] [data…]
 | `D` | Disconnect the selected channel |
 | `I` | Query own callsign |
 | `I <CALL>` | Set own callsign |
-| `L` | Query link status |
+| `L` | Query numeric status/buffer counters (see below) |
 | `JHOST0` | Leave hostmode, return to terminal mode |
 | `JHOST1` | Enter binary hostmode (TNC responds with ack) |
 | `V` | Query firmware version string |
 | `S` | Query selected channel |
-| `S <n>` | Select channel n (0–8) |
+| `S <n>` | Select channel n (0–8; Station G2: 0–10) |
+
+`L` returns two numbers on channel 0: pending monitor headers and pending
+received data frames. Connected channels return six numbers: pending link
+status messages, pending received data frames, queued transmit frames,
+unacknowledged frames, retry count, and a connected flag (0 or 1).
+No callsign or other text is appended. Use `@D` for peer diagnostics.
+
+Binary replies are assembled and written as complete frames, with partial-write
+handling and a serial drain before servicing the next request. Counted binary
+payloads are not interpreted as console escape commands. The serial RX buffer
+holds a complete maximum-size request (3-byte header plus 256-byte payload).
+Incomplete requests are discarded after one second without another received
+byte, allowing clients to resynchronize rather than remaining stuck mid-frame.
+For timeout diagnosis,
+`@D` also reports uptime, the ESP32 reset-reason code, failed reply writes
+(`outFail`), discarded incomplete requests (`rxTimeout`), and the maximum
+reply-write/drain time (`block_ms`).
 
 ### Parameters
 
@@ -71,7 +118,7 @@ All parameters can be queried (send without argument → TNC replies with curren
 | `T` | TX delay (× 10 ms) | 30 | 0–127 |
 | `W` | Slot time (× 10 ms) | 10 | 0–127 |
 | `X` | TX enable | 1 | 0–1 |
-| `Y` | Max incoming connections | 4 | 0–8 |
+| `Y` | Max incoming connections | 4 | 0–8 (Station G2: 0–10) |
 | `Z` | Flow control: bit 0 = RTS/CTS, bit 1 = XON/XOFF | 3 | 0–3 |
 | `M` | Monitor mode string | `IU` | see below |
 | `U` | Unattended mode + connect text | 0 | 0–2 |
@@ -123,7 +170,7 @@ In terminal mode (after `mode ded` but before `JHOST1`) the TNC accepts plain te
 | `BTEXT [text]` | Query or set beacon text |
 | `CONNECT <CALL>` | Connect on current channel |
 | `DISCONNECT` | Disconnect current channel |
-| `JHOST1` | Switch to binary hostmode |
+| `ESC JHOST1 CR` | Switch to binary hostmode |
 | `QRES` | Reset all DED parameters to defaults |
 
 ## Event codes (TNC → host)

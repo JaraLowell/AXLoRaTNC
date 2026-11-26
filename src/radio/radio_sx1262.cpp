@@ -5,7 +5,7 @@
 #include "util/timer.h"
 #include "util/log.h"
 
-#if defined(AXLORA_VARIANT_DEVKITV1_E22) || defined(AXLORA_VARIANT_HELTEC_V3) || defined(AXLORA_VARIANT_TBEAM_SUPREME_433)
+#if defined(AXLORA_VARIANT_DEVKITV1_E22) || defined(AXLORA_VARIANT_HELTEC_V3) || defined(AXLORA_VARIANT_TBEAM_SUPREME_433) || defined(AXLORA_VARIANT_STATION_G2)
 
 namespace axlora::radio {
 namespace {
@@ -45,14 +45,44 @@ class Sx1262Driver final : public Driver {
       LOG_ERR("SX1262 init failed: %d", state);
       return Result::HardwareError;
     }
+#if defined(AXLORA_VARIANT_STATION_G2)
+    int16_t configState = radio_.setCurrentLimit(variant::DEFAULT_CURRENT_LIMIT_MA);
+    if (configState == RADIOLIB_ERR_NONE) {
+      configState = radio_.setRxBoostedGainMode(false);
+    }
+    if (configState == RADIOLIB_ERR_NONE) {
+      configState = radio_.setDio2AsRfSwitch(variant::USE_DIO2_RF_SWITCH);
+    }
+    if (configState != RADIOLIB_ERR_NONE) {
+      LOG_ERR("SX1262 configuration failed: %d", configState);
+      return Result::HardwareError;
+    }
+#else
     radio_.setDio2AsRfSwitch(variant::USE_DIO2_RF_SWITCH);
+#endif
     if constexpr (variant::HAS_EXTERNAL_RF_SWITCH) {
       radio_.setRfSwitchPins(radioLibPin(variant::PIN_RADIO_RXEN),
                              radioLibPin(variant::PIN_RADIO_TXEN));
     }
+#if defined(AXLORA_VARIANT_STATION_G2)
+    configState = radio_.setCRC(true);
+    if (configState != RADIOLIB_ERR_NONE) {
+      LOG_ERR("SX1262 CRC configuration failed: %d", configState);
+      return Result::HardwareError;
+    }
+#else
     radio_.setCRC(true);
+#endif
     radio_.setDio1Action(onDio1Interrupt);
+#if defined(AXLORA_VARIANT_STATION_G2)
+    configState = radio_.startReceive();
+    if (configState != RADIOLIB_ERR_NONE) {
+      LOG_ERR("SX1262 receive start failed: %d", configState);
+      return Result::HardwareError;
+    }
+#else
     radio_.startReceive();
+#endif
     return Result::Ok;
   }
 

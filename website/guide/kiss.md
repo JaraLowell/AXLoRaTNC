@@ -8,7 +8,17 @@ AXLoRaTNC implements standard KISS framing over USB serial (`0xC0` FEND delimite
 mode kiss
 ```
 
-The mode is stored in NVS. To recover the console from KISS mode, type the plain text string `console` followed by Enter.
+KISS hosts do not need to type a command first:
+
+- The first KISS `0xC0` FEND from the host switches the port fully into KISS mode. This works from the console, from WA8DED terminal mode, and between WA8DED hostmode frames.
+- TAPR/Kenwood-style init text `KISS ON` (followed by an ignored `RESTART`) also enters KISS. KISSINIT-style `KISS.INI` sections such as GPNG's work unchanged.
+- The standard KISS Return frame `C0 FF C0` leaves KISS and returns to the console. From there, `ESC JHOST1 CR` enters WA8DED hostmode again.
+
+The mode change is not persisted; after a reset the TNC starts in the console.
+
+::: tip Native USB reset
+On ESP32-S3 boards using native USB (such as the Station G2), dropping DTR while RTS is asserted hardware-resets the chip. Some KISS clients (GPNG, for example) pulse DTR when they open the port. The TNC reboots in under 1.5 s, sends its boot beacon if beacons are enabled, and then accepts KISS normally.
+:::
 
 ## Protocol details
 

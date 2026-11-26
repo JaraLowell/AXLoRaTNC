@@ -14,7 +14,11 @@
 
 namespace axlora::tnc {
 
+#if defined(AXLORA_VARIANT_STATION_G2)
+static constexpr uint8_t CHANNEL_COUNT = 10;
+#else
 static constexpr uint8_t CHANNEL_COUNT = 8;
+#endif
 
 struct KissParams {
   uint8_t txDelay    = 0;     // 0 ms — LoRa has no RF warm-up requirement
@@ -79,6 +83,7 @@ class Tnc {
   struct ChannelState {
     ax25::LinkLayer   link{};
     ax25::LinkState   lastState       = ax25::LinkState::Disconnected;
+    uint8_t           loopbackPeer    = CHANNEL_COUNT;
     char              nodeLine[96]{};
     size_t            nodeLinePos     = 0;
     bool              nodeGreetingSent = false;
@@ -137,6 +142,13 @@ class Tnc {
     uint8_t  chIdx       = 0xFF;  // 0xFF = not a link-layer frame
     uint32_t id          = 0;
     bool     priority    = false;
+  };
+
+  struct LoopbackTx {
+    uint8_t data[MAX_PACKET_BYTES]{};
+    size_t len = 0;
+    uint8_t source = CHANNEL_COUNT;
+    uint8_t destination = CHANNEL_COUNT;
   };
 
   static constexpr size_t RAW_TX_QUEUE_CAPACITY = 160;
@@ -211,6 +223,8 @@ class Tnc {
   bool enqueueRawTx(const uint8_t* data, size_t len, uint32_t delayMs, uint8_t chIdx = 0xFF);
   bool rawFramePriority(const uint8_t* data, size_t len) const;
   void serviceRawTx(bool radioReady);
+  void serviceLoopbackTx();
+  bool connectChannel(uint8_t chIdx, const ax25::Address& destination);
   void serviceRadio();
   int  findChannelForIncoming(const ax25::Frame& frame) const;
 
@@ -237,6 +251,7 @@ class Tnc {
   void handleDedHostFrame(uint8_t channel, uint8_t infoCmd, const uint8_t* data, size_t len);
   void handleDedCommand(uint8_t channel, const char* command, size_t len);
   void sendDedShort(uint8_t channel, uint8_t code);
+  void writeDedReply(const uint8_t* data, size_t len);
   void sendDedText(uint8_t channel, uint8_t code, const char* text);
   void sendDedCounted(uint8_t channel, uint8_t code, const uint8_t* data, size_t len);
   unsigned dedFreeBufferBytes(uint8_t channel) const;
@@ -311,6 +326,7 @@ class Tnc {
   uint32_t            lastRxMs_           = 0;
   ChannelCtx     channelCtx_[CHANNEL_COUNT]{};
   ChannelState   channels_[CHANNEL_COUNT]{};
+  util::RingBuffer<LoopbackTx, 8> loopbackTxQueue_;
 
   ax25::KissDecoder kiss_;
   KissParams        kissParams_{};
@@ -318,7 +334,6 @@ class Tnc {
   size_t            linePos_     = 0;
   char              escapeLine_[16]{};
   size_t            escapePos_   = 0;
-  bool              kissActive_  = false;
   SerialMode        serialMode_  = SerialMode::Console;
   uint32_t          baudKiss_    = 9600;
   uint32_t          baudDed_     = 9600;
@@ -329,6 +344,10 @@ class Tnc {
   uint8_t dedData_[256]{};
   size_t  dedDataPos_   = 0;
   size_t  dedDataLen_   = 0;
+  uint32_t dedLastByteMs_ = 0;
+  uint32_t dedRxTimeouts_ = 0;
+  uint32_t dedOutPartialWrites_ = 0;
+  uint32_t dedOutBlockMsMax_ = 0;
   axlora::util::RingBuffer<DedEvent, 32> dedEvents_;
   bool    dedHostMode_         = false;
   bool    dedTerminalCommand_  = false;
