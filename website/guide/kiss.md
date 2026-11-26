@@ -17,7 +17,13 @@ KISS hosts do not need to type a command first:
 The mode change is not persisted; after a reset the TNC starts in the console.
 
 ::: tip Native USB reset
-On ESP32-S3 boards using native USB (such as the Station G2), dropping DTR while RTS is asserted hardware-resets the chip. Some KISS clients (GPNG, for example) pulse DTR when they open the port. The TNC reboots in under 1.5 s, sends its boot beacon if beacons are enabled, and then accepts KISS normally.
+The Station G2's ESP USB Serial/JTAG interface (`303A:1001`) uses DTR/RTS
+transitions for chip reset/download control. Older KISS clients that pulse
+these lines can leave the modem unresponsive instead of simply reconnecting.
+Updated GPNG detects this interface and avoids manual DTR/RTS changes during
+open, KISS reset and close; ordinary serial adapters keep their existing behavior.
+If a previous client left the G2 unresponsive, press RESET (not BOOT).
+An actual reboot can transmit the boot beacon if beacons are enabled.
 :::
 
 ## Protocol details
@@ -92,6 +98,22 @@ it does not change USB mode or Wi-Fi settings. Received frames and parameter
 handling use the same KISS framing as USB, with no text or TX echo on TCP.
 Slow clients are disconnected if the output queue fills or sending stalls for
 three seconds, rather than blocking radio service.
+
+### Long idle connections
+
+Each accepted TCP client has TCP-level keepalive enabled: probes start after
+120 seconds idle, repeat every 30 seconds, and five unanswered probes cause
+the socket to fail. The firmware detects EOF/socket errors even when there
+is no queued radio traffic, closes the dead client and frees the single-client
+slot. Buffered incoming bytes are drained before an orderly close is handled.
+
+Keepalive uses TCP control packets only: no KISS payload, RF transmission,
+console handshake or application-level ping. A healthy TCP connection can
+remain idle for hours or days. Detection of a silently unreachable peer takes
+approximately 4.5 minutes; normal disconnects and detected Wi-Fi loss are handled
+sooner. Clients must reconnect after a loss; updated GPNG enables the same
+keepalive settings and retries once a minute, with its existing ten-failure limit.
+An idle TCP connection does not by itself mean that an AX.25 radio session is idle.
 
 ::: warning Trusted local networks only
 KISS TCP has no authentication or encryption. Anyone who can reach port 8100

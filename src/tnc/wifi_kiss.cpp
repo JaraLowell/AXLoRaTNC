@@ -7,6 +7,43 @@
 #include "util/log.h"
 
 namespace axlora::tnc {
+namespace {
+
+bool enableKeepalive(WiFiClient& client) {
+  const struct {
+    int level;
+    int option;
+    int value;
+  } options[] = {
+      {SOL_SOCKET, SO_KEEPALIVE, 1},
+      {IPPROTO_TCP, TCP_KEEPIDLE, 120},
+      {IPPROTO_TCP, TCP_KEEPINTVL, 30},
+      {IPPROTO_TCP, TCP_KEEPCNT, 5},
+  };
+  for (const auto& option : options) {
+    if (::setsockopt(client.fd(), option.level, option.option,
+                     &option.value, sizeof(option.value)) != 0) {
+      LOG_ERR("KISS TCP keepalive setup failed: option=%d errno=%d", option.option, errno);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool clientConnected(WiFiClient& client) {
+  // Drain WiFiClient's buffered bytes before checking EOF on the underlying socket.
+  if (client.available() > 0) return true;
+  if (client.fd() < 0) return false;
+  uint8_t byte = 0;
+  const int received = ::recv(client.fd(), &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+  if (received > 0) return true;
+  if (received == 0) return false;
+  if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return true;
+  LOG_WARN("KISS TCP receive failed: errno=%d", errno);
+  return false;
+}
+
+}
 
 void WifiKiss::begin() {
   WiFi.persistent(false);
@@ -103,11 +140,13 @@ void WifiKiss::loop(bool allowClient) {
     const IPAddress ip = mode_ == Mode::AccessPoint ? WiFi.softAPIP() : WiFi.localIP();
     LOG_INFO("KISS TCP listening on %s:8100", ip.toString().c_str());
   }
-  if (clientActive_ && !client_.connected()) closeClient();
+  if (clientActive_ && !clientConnected(client_)) closeClient();
   WiFiClient incoming = server_.available();
   if (incoming) {
     if (clientActive_ || !allowClient) {
       LOG_WARN("KISS TCP client rejected: TNC busy");
+      incoming.stop();
+    } else if (!enableKeepalive(incoming)) {
       incoming.stop();
     } else {
       client_ = incoming;
