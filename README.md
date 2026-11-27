@@ -22,6 +22,8 @@ Use the browser-based installer — no drivers or tools needed. Works in Chrome 
 | BQ Station G2 | ESP32-S3 | SX1262 + PA | `station_g2` | ✅ tested |
 | Seeed SenseCAP Solar | nRF52840 | SX1262 | `sensecap_solar` | ⚠ experimental; hardware not tested |
 
+Seed SenseCAP Solar only act as a DIGIpeater not ment as a modem to connect to
+
 On OLED-equipped devices, the screen sleeps after 60 seconds without successful
 LoRa packet transmission or reception and wakes on the next radio activity.
 This is checked at the existing one-second display refresh interval. Serial/TCP
