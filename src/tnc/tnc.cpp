@@ -1,7 +1,11 @@
 #include "tnc.h"
 #include <Arduino.h>
+#if defined(NRF52_PLATFORM)
+#include "util/nrf_preferences.h"
+#else
 #include <Preferences.h>
 #include <esp_system.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include "aprs/aprs.h"
@@ -11,6 +15,9 @@
 #include "util/log.h"
 #include "util/timer.h"
 #include "ded_protocol.h"
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+#include "variant/sensecap_solar_power.h"
+#endif
 
 #ifndef AXLORATNC_TRACE_LINFBB
 #define AXLORATNC_TRACE_LINFBB 0
@@ -24,6 +31,17 @@
 
 namespace axlora::tnc {
 namespace {
+
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+#if defined(NRF52_PLATFORM)
+// millis() wraps when the 1024 Hz tick counter wraps, before reaching UINT32_MAX.
+static constexpr uint32_t RELAY_TICKS_PER_SECOND = configTICK_RATE_HZ;
+static uint32_t relayUptimeTick() { return xTaskGetTickCount(); }
+#else
+static constexpr uint32_t RELAY_TICKS_PER_SECOND = 1000;
+static uint32_t relayUptimeTick() { return millis(); }
+#endif
+#endif
 
 #if defined(AXLORA_VARIANT_STATION_G2)
 static constexpr int FREQUENCY_DECIMALS = 4;
@@ -134,6 +152,10 @@ static bool isValidBaud(uint32_t baud) {
 // ---------------------------------------------------------------------------
 
 void Tnc::begin(const char* callsign) {
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  relayLastUptimeTicks_ = relayUptimeTick();
+  relayUptimeTicks_ = relayLastUptimeTicks_;
+#endif
   loadSettings();
   applySerialBaud();
   mailbox_.begin();
@@ -212,6 +234,10 @@ bool Tnc::setChannelLocal(uint8_t chIdx, const ax25::Address& local) {
 }
 
 void Tnc::loop(bool radioReady) {
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  updateRelayUptime();
+#endif
+  if (!radioReady) radioConfigApplied_ = false;
   ++dedRoundsCount_;
   const uint32_t roundsElapsed = millis() - dedRoundsStartMs_;
   if (roundsElapsed >= 1000) {
@@ -247,6 +273,11 @@ void Tnc::loop(bool radioReady) {
     channels_[i].link.loop();
   }
   checkLinkStatusEvents();
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  if (serialMode_ == SerialMode::Console) {
+    for (uint8_t i = 0; i < CHANNEL_COUNT; ++i) serviceRelayResponses(i);
+  }
+#endif
   if (serialMode_ == SerialMode::Wa8ded && !dedHostMode_) {
     serviceDedTerminalOutput();
   }
@@ -415,9 +446,11 @@ void Tnc::serviceRawTx(bool radioReady) {
     // Echo transmitted frames as KISS only on the console port. In WA8DED hostmode
     // the same serial stream belongs to the host protocol and raw KISS bytes would
     // force clients such as LinFBB to resync before seeing pending events.
+#if !defined(AXLORA_VARIANT_SENSECAP_SOLAR)
     if (serialMode_ == SerialMode::Console && !kissTcpActive() && tx.len >= 2) {
       emitKissData(tx.data, tx.len - 2);
     }
+#endif
     // Restart T1 from now — frame is on air. Corrects for CSMA + LoRa airtime delay.
     if (tx.chIdx < CHANNEL_COUNT) {
       channels_[tx.chIdx].link.notifyTxSent();
@@ -547,7 +580,11 @@ void Tnc::serviceRadio() {
                    static_cast<unsigned>(frame.infoLen));
     }
     const bool tcpOwnsReceive = kissTcpActive();
-    if (serialMode_ == SerialMode::Console || serialMode_ == SerialMode::Kiss || tcpOwnsReceive) {
+    if (
+#if !defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+        serialMode_ == SerialMode::Console ||
+#endif
+        serialMode_ == SerialMode::Kiss || tcpOwnsReceive) {
       emitKissData(rx.data, rx.len - 2);
     }
     if (serialMode_ == SerialMode::Kiss || tcpOwnsReceive) return;
@@ -920,6 +957,9 @@ void Tnc::handleConsoleLine(char* line) {
     Serial.println("          send [ch] <msg> sendui <DEST> <msg>");
     Serial.println("          beacon [on|off|now|text|dest|interval|path]");
     Serial.println("          mheard [clear] digi [on|off|mode ui|all] digialias [CALL|off]");
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+    Serial.println("          manager [name]");
+#endif
     Serial.println("          node [on|off|alias|ident|interval|broadcast] nodes routes");
     Serial.println("          KISS ON (enter KISS; KISS frame C0 FF C0 returns here)");
 #if defined(AXLORA_VARIANT_STATION_G2)
@@ -929,6 +969,29 @@ void Tnc::handleConsoleLine(char* line) {
   } else if (strcmp(cmd, "info") == 0) {
     printInfo();
 
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  } else if (strcmp(cmd, "manager") == 0) {
+    const char* value = skipSpaces(strtok(nullptr, ""));
+    if (value == nullptr || *value == '\0') {
+      Serial.printf("manager=%s\n", manager_);
+    } else if (strlen(value) >= sizeof(manager_) || strpbrk(value, "\r\n") != nullptr) {
+      Serial.println("invalid manager name");
+    } else {
+      Preferences prefs;
+      if (!prefs.begin("axloratnc", false)) {
+        Serial.println("manager: settings storage unavailable");
+      } else {
+        const size_t written = prefs.putString("manager", value);
+        prefs.end();
+        if (written != strlen(value)) {
+          Serial.println("manager: settings save failed");
+        } else {
+          copySanitizedNodeText(manager_, sizeof(manager_), value);
+          Serial.printf("manager=%s\n", manager_);
+        }
+      }
+    }
+#endif
   } else if (strcmp(cmd, "mode") == 0) {
     char* mode = strtok(nullptr, " ");
     if (mode == nullptr) {
@@ -1590,6 +1653,14 @@ void Tnc::checkLinkStatusEvents() {
       channels_[i].shellMode        = ShellMode::Node;
       channels_[i].nodeLinePos      = 0;
       channels_[i].composeBodyPos   = 0;
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+      if (state == ax25::LinkState::Disconnected) {
+        cs.relayGreetingPending = false;
+        cs.relayInfoPending = false;
+        cs.relayDisconnectPending = false;
+        cs.relayMheardPending = false;
+      }
+#endif
     }
 
     const uint8_t channel = i + 1;
@@ -1658,12 +1729,22 @@ void Tnc::checkLinkStatusEvents() {
           const size_t pos = strlen(text);
           snprintf(text + pos, sizeof(text) - pos, " - %s", stamp);
         }
-        if (!enqueueDedEvent(channel, 3, reinterpret_cast<const uint8_t*>(text), strlen(text)))
+        if (
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+            serialMode_ == SerialMode::Wa8ded &&
+#endif
+            !enqueueDedEvent(channel, 3, reinterpret_cast<const uint8_t*>(text), strlen(text)))
           continue;
       }
     }
     channels_[i].lastState = state;
     cs.lastResetCount = cs.link.resetCount();
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+    if (serialMode_ == SerialMode::Console && state == ax25::LinkState::Connected &&
+        prevState == ax25::LinkState::Disconnected) {
+      cs.relayGreetingPending = true;
+    }
+#endif
     if (serialMode_ == SerialMode::Wa8ded && dedUnattended_ &&
         state == ax25::LinkState::Connected && prevState == ax25::LinkState::Disconnected &&
         dedUnattendedText_[0] != '\0') {
@@ -1678,20 +1759,36 @@ void Tnc::checkLinkStatusEvents() {
 
 void Tnc::processNodeInput(uint8_t chIdx, const uint8_t* data, size_t len) {
   ChannelState& cs = channels_[chIdx];
+#if !defined(AXLORA_VARIANT_SENSECAP_SOLAR)
   if (!cs.nodeGreetingSent) {
     sendNodeText(chIdx, "*** AXLoRaTNC\rType ? for commands or BBS for mailbox\r");
     cs.nodeGreetingSent = true;
   }
+#endif
   for (size_t i = 0; i < len; ++i) {
     const uint8_t byte = data[i];
     const char c = static_cast<char>(byte);
     if (c == '\r' || c == '\n') {
       cs.nodeLine[cs.nodeLinePos] = '\0';
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+      if (strcasecmp(cs.nodeLine, "//MH") == 0 ||
+          strcasecmp(cs.nodeLine, "//MHEARD") == 0) {
+        cs.relayMheardPending = true;
+        cs.relayMheardIndex = 0;
+      } else if (strcasecmp(cs.nodeLine, "//I") == 0) {
+        cs.relayInfoPending = true;
+      } else if (strcasecmp(cs.nodeLine, "//Q") == 0) {
+        cs.relayDisconnectPending = true;
+        cs.nodeLinePos = 0;
+        return;
+      }
+#else
       switch (cs.shellMode) {
         case ShellMode::Node:       handleNodeLine(chIdx, cs.nodeLine);        break;
         case ShellMode::Bbs:        handleBbsLine(chIdx, cs.nodeLine);         break;
         case ShellMode::BbsCompose: handleBbsComposeLine(chIdx, cs.nodeLine);  break;
       }
+#endif
       cs.nodeLinePos = 0;
       continue;
     }
@@ -1704,6 +1801,93 @@ void Tnc::processNodeInput(uint8_t chIdx, const uint8_t* data, size_t len) {
       cs.nodeLine[cs.nodeLinePos++] = c;
   }
 }
+
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+void Tnc::updateRelayUptime() {
+  const uint32_t now = relayUptimeTick();
+  relayUptimeTicks_ += static_cast<uint32_t>(now - relayLastUptimeTicks_);
+  relayLastUptimeTicks_ = now;
+}
+
+void Tnc::serviceRelayResponses(uint8_t chIdx) {
+  ChannelState& cs = channels_[chIdx];
+  if (cs.link.state() != ax25::LinkState::Connected) return;
+  if (cs.relayDisconnectPending) {
+    if (!dedTxEnabled_) return;
+    rawTxQueueDrops_ += static_cast<uint32_t>(rawTxQueue_.removeChannel(chIdx));
+    rawTxQueueDrops_ += static_cast<uint32_t>(rawTxPriorityQueue_.removeChannel(chIdx));
+    if (rawTxPriorityQueue_.free() == 0) return;
+    if (!cs.link.disconnect()) {
+      LOG_ERR("relay disconnect failed on channel %u", static_cast<unsigned>(chIdx + 1));
+    }
+    cs.relayDisconnectPending = false;
+    return;
+  }
+  if (cs.relayGreetingPending) {
+    char text[100]{};
+    snprintf(text, sizeof(text), "This station is managed by %s.\r", manager_);
+    if (!sendConnectedChunked(chIdx, reinterpret_cast<const uint8_t*>(text), strlen(text))) return;
+    cs.relayGreetingPending = false;
+  }
+  if (cs.relayInfoPending) {
+    if (dedConnectedAcceptFrameCapacity(chIdx) == 0) return;
+    uint16_t millivolts = 0;
+    char battery[24]{};
+    if (variant::readBatteryMillivolts(millivolts)) {
+      snprintf(battery, sizeof(battery), "%u.%03u V (%u%%)",
+               static_cast<unsigned>(millivolts / 1000),
+               static_cast<unsigned>(millivolts % 1000),
+               static_cast<unsigned>(variant::batteryPercentageFromMillivolts(millivolts)));
+    } else {
+      snprintf(battery, sizeof(battery), "unavailable");
+    }
+    updateRelayUptime();
+    const uint64_t totalMinutes = relayUptimeTicks_ / (RELAY_TICKS_PER_SECOND * 60UL);
+    const unsigned long totalHours = static_cast<unsigned long>(totalMinutes / 60);
+    char uptime[48]{};
+    if (totalHours >= 24) {
+      const unsigned long days = totalHours / 24;
+      const unsigned long hours = totalHours % 24;
+      snprintf(uptime, sizeof(uptime), "%lu day%s and %02lu hour%s",
+               days, days == 1 ? "" : "s", hours, hours == 1 ? "" : "s");
+    } else {
+      const unsigned long minutes = static_cast<unsigned long>(totalMinutes % 60);
+      snprintf(uptime, sizeof(uptime), "%02lu hour%s and %02lu minute%s",
+               totalHours, totalHours == 1 ? "" : "s",
+               minutes, minutes == 1 ? "" : "s");
+    }
+    const radio::Stats& stats = radio::stats();
+    char text[128]{};
+    snprintf(text, sizeof(text), "Battery: %s  TX: %lu  RX: %lu  Uptime: %s\r", battery,
+             static_cast<unsigned long>(stats.txOk), static_cast<unsigned long>(stats.rxOk),
+             uptime);
+    if (!sendConnectedChunked(chIdx, reinterpret_cast<const uint8_t*>(text), strlen(text))) return;
+    cs.relayInfoPending = false;
+  }
+  if (!cs.relayMheardPending) return;
+  if (cs.relayMheardIndex == 0) {
+    const char* header = "callsign   dest       first    last     fr  rssi  snr\r";
+    if (!sendConnectedChunked(chIdx, reinterpret_cast<const uint8_t*>(header), strlen(header))) return;
+    ++cs.relayMheardIndex;
+  }
+  while (cs.relayMheardIndex <= sizeof(mheard_) / sizeof(mheard_[0])) {
+    const MheardEntry& entry = mheard_[cs.relayMheardIndex - 1];
+    if (entry.active) {
+      char src[12]{}, dst[12]{}, first[16]{}, last[16]{}, row[96]{};
+      ax25::formatAddress(entry.source, src, sizeof(src));
+      ax25::formatAddress(entry.destination, dst, sizeof(dst));
+      formatUptime(entry.firstHeardMs, first, sizeof(first));
+      formatUptime(entry.lastHeardMs, last, sizeof(last));
+      snprintf(row, sizeof(row), "%-10s %-10s %s %s %3lu %5.1f %5.1f\r",
+               src, dst, first, last, static_cast<unsigned long>(entry.frames),
+               static_cast<double>(entry.lastRssi), static_cast<double>(entry.lastSnr));
+      if (!sendConnectedChunked(chIdx, reinterpret_cast<const uint8_t*>(row), strlen(row))) return;
+    }
+    ++cs.relayMheardIndex;
+  }
+  cs.relayMheardPending = false;
+}
+#endif
 
 void Tnc::handleNodeLine(uint8_t chIdx, const char* line) {
   // Build uppercase command token
@@ -2575,7 +2759,11 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
                             static_cast<double>(lastRssi_),
                             static_cast<double>(lastSnr_),
                             static_cast<unsigned long>(millis()),
+#if defined(NRF52_PLATFORM)
+                            static_cast<unsigned>(NRF_POWER->RESETREAS),
+#else
                             static_cast<unsigned>(esp_reset_reason()),
+#endif
                             static_cast<unsigned long>(dedOutPartialWrites_),
                             static_cast<unsigned long>(dedRxTimeouts_),
                             static_cast<unsigned long>(dedOutBlockMsMax_));
@@ -2818,7 +3006,11 @@ void Tnc::handleDedCommand(uint8_t channel, const char* command, size_t len) {
   if (strcmp(cmd, "QRES") == 0) {
     sendDedShort(channel, 0);
     Serial.flush();
+#if defined(NRF52_PLATFORM)
+    NVIC_SystemReset();
+#else
     ESP.restart();
+#endif
     return;
   }
   invalidCommand();
@@ -3345,7 +3537,11 @@ void Tnc::fillDisplayInfo(display::DisplayInfo& out) const {
     out.l2FrmrTx     += s.frmrTx;
     out.l2QueueDrops += s.queueDrops;
   }
+#if defined(NRF52_PLATFORM)
+  out.freeHeapBytes = static_cast<uint32_t>(xPortGetFreeHeapSize());
+#else
   out.freeHeapBytes = static_cast<uint32_t>(ESP.getFreeHeap());
+#endif
 
   // ---- page 4: mheard — top MHEARD_COUNT stations by most recent ----
   {
@@ -3408,8 +3604,20 @@ void Tnc::fillDisplayInfo(display::DisplayInfo& out) const {
 
 void Tnc::loadSettings() {
   Preferences prefs;
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  settingsReady_ = false;
+#endif
   if (prefs.begin("axloratnc", true)) {
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+    settingsReady_ = true;
+#endif
     prefs.getString("callsign", savedCallsign_, sizeof(savedCallsign_));
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+    if (prefs.isKey("manager")) {
+      prefs.getString("manager", manager_, sizeof(manager_));
+      copySanitizedNodeText(manager_, sizeof(manager_), manager_);
+    }
+#endif
     radioConfig_.frequencyMHz    = prefs.getFloat("r_freq", variant::DEFAULT_FREQUENCY_MHZ);
     radioConfig_.frequencyCorrectionMHz = prefs.getFloat("r_fcorr", variant::DEFAULT_FREQUENCY_CORRECTION_MHZ);
     radioConfig_.bandwidthKhz    = prefs.getFloat("r_bw",   variant::DEFAULT_BANDWIDTH_KHZ);
@@ -3686,7 +3894,7 @@ void Tnc::applySerialBaud() {
   uint32_t baud = variant::SERIAL_BAUD;
   if (serialMode_ == SerialMode::Kiss)   baud = baudKiss_;
   if (serialMode_ == SerialMode::Wa8ded) baud = baudDed_;
-#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
+#if defined(NRF52_PLATFORM) || (defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT)
   Serial.begin(baud);
 #else
   Serial.updateBaudRate(baud);

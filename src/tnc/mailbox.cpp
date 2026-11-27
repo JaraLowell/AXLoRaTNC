@@ -1,6 +1,10 @@
 #include "mailbox.h"
 #include <Arduino.h>
+#if defined(NRF52_PLATFORM)
+#include "util/nrf_preferences.h"
+#else
 #include <Preferences.h>
+#endif
 #include <string.h>
 #include <stdio.h>
 

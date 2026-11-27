@@ -29,8 +29,13 @@ struct KissParams {
 };
 
 struct DigipeaterConfig {
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  bool         enabled  = true;
+  bool         allFrames = true;
+#else
   bool         enabled  = false;
   bool         allFrames = false;
+#endif
   ax25::Address alias{};
   bool         hasAlias = false;
 };
@@ -65,6 +70,9 @@ class Tnc {
   void begin(const char* callsign);
   void loop(bool radioReady);
   bool quietSerialMode() const { return serialMode_ != SerialMode::Console; }
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  bool settingsReady() const { return settingsReady_; }
+#endif
   void printInfo() const;
   void printStats() const;
   void fillDisplayInfo(display::DisplayInfo& out) const;
@@ -94,6 +102,13 @@ class Tnc {
     char              nodeLine[96]{};
     size_t            nodeLinePos     = 0;
     bool              nodeGreetingSent = false;
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+    bool              relayGreetingPending = false;
+    bool              relayInfoPending = false;
+    bool              relayDisconnectPending = false;
+    bool              relayMheardPending = false;
+    uint8_t           relayMheardIndex = 0;
+#endif
     ShellMode         shellMode       = ShellMode::Node;
     // BBS compose state
     char              composeTo[12]{};
@@ -206,6 +221,22 @@ class Tnc {
       return true;
     }
 
+    size_t removeChannel(uint8_t channel) {
+      if (items_ == nullptr) return 0;
+      const size_t oldCount = count_;
+      size_t kept = 0;
+      for (size_t i = 0; i < oldCount; ++i) {
+        const size_t index = (tail_ + i) % capacity_;
+        if (items_[index].chIdx != channel) {
+          items_[(tail_ + kept) % capacity_] = items_[index];
+          ++kept;
+        }
+      }
+      count_ = kept;
+      head_ = (tail_ + kept) % capacity_;
+      return oldCount - kept;
+    }
+
     bool empty() const { return count_ == 0; }
     bool full() const { return items_ == nullptr || count_ == capacity_; }
     size_t size() const { return count_; }
@@ -287,6 +318,10 @@ class Tnc {
   void handleBbsLine(uint8_t chIdx, const char* line);
   void handleBbsComposeLine(uint8_t chIdx, const char* line);
   void sendNodeText(uint8_t chIdx, const char* text);
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  void updateRelayUptime();
+  void serviceRelayResponses(uint8_t chIdx);
+#endif
   // Splits data into PACLEN-sized I-frames before queuing
   bool sendConnectedChunked(uint8_t chIdx, const uint8_t* data, size_t len);
 
@@ -336,6 +371,12 @@ class Tnc {
   // ---- Members ----
   ax25::Address       local_{};
   char                savedCallsign_[12]{};
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  char                manager_[64] = "not configured";
+  bool                settingsReady_ = false;
+  uint64_t            relayUptimeTicks_ = 0;
+  uint32_t            relayLastUptimeTicks_ = 0;
+#endif
   radio::RadioConfig  radioConfig_{};
   bool                dutyCycleEnabled_  = true;
   uint32_t            dutyCyclePpm_      = variant::DUTY_CYCLE_PPM;

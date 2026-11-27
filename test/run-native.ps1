@@ -14,6 +14,8 @@ $sources = @(
 ) | ForEach-Object { '"' + (Join-Path $root $_) + '"' }
 $includes = @('test\native', 'src', 'include', 'variants\devkitv1_e22') |
   ForEach-Object { '/I"' + (Join-Path $root $_) + '"' }
+$solarIncludes = @('test\native', 'src', 'include', 'variants\sensecap_solar') |
+  ForEach-Object { '/I"' + (Join-Path $root $_) + '"' }
 $displaySources = @('test\test_display.cpp', 'src\display\display.cpp') |
   ForEach-Object { '"' + (Join-Path $root $_) + '"' }
 $setup = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
@@ -21,6 +23,12 @@ $command = 'call "' + $setup + '" >nul && cd /d "' + $build +
   '" && cl /nologo /std:c++17 /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS /DAXLORA_VARIANT_DEVKITV1_E22 ' +
   ($includes -join ' ') + ' ' + ($sources -join ' ') +
   ' /Fe:wa8ded-tests.exe && wa8ded-tests.exe' +
+  ' && cl /nologo /std:c++17 /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS /DAXLORA_VARIANT_DEVKITV1_E22 /DAXLORA_VARIANT_SENSECAP_SOLAR ' +
+  ($solarIncludes -join ' ') + ' ' + ($sources -join ' ') +
+  ' /Fe:sensecap-relay-tests.exe && sensecap-relay-tests.exe' +
+  ' && cl /nologo /std:c++17 /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS /DNRF52_PLATFORM ' +
+  ($includes -join ' ') + ' "' + (Join-Path $root 'test\test_nrf_preferences.cpp') + '" "' +
+  (Join-Path $root 'src\util\nrf_preferences.cpp') + '" /Fe:nrf-preferences-tests.exe && nrf-preferences-tests.exe' +
   ' && cl /nologo /std:c++17 /EHsc /W3 /D_CRT_SECURE_NO_WARNINGS /DAXLORA_VARIANT_DEVKITV1_E22 /DAXLORA_HAS_OLED ' +
   ($includes -join ' ') + ' ' + ($displaySources -join ' ') +
   ' /Fe:display-tests.exe && display-tests.exe' +

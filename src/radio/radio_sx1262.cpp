@@ -5,7 +5,11 @@
 #include "util/timer.h"
 #include "util/log.h"
 
-#if defined(AXLORA_VARIANT_DEVKITV1_E22) || defined(AXLORA_VARIANT_HELTEC_V3) || defined(AXLORA_VARIANT_TBEAM_SUPREME_433) || defined(AXLORA_VARIANT_STATION_G2)
+#if !defined(IRAM_ATTR)
+#define IRAM_ATTR
+#endif
+
+#if defined(AXLORA_VARIANT_DEVKITV1_E22) || defined(AXLORA_VARIANT_HELTEC_V3) || defined(AXLORA_VARIANT_TBEAM_SUPREME_433) || defined(AXLORA_VARIANT_STATION_G2) || defined(AXLORA_VARIANT_SENSECAP_SOLAR)
 
 namespace axlora::radio {
 namespace {
@@ -31,8 +35,14 @@ class Sx1262Driver final : public Driver {
       pinMode(variant::PIN_LED_RX, OUTPUT);
       digitalWrite(variant::PIN_LED_RX, LOW);
     }
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+    SPI.setPins(variant::PIN_RADIO_SPI_MISO, variant::PIN_RADIO_SPI_SCK,
+                variant::PIN_RADIO_SPI_MOSI);
+    SPI.begin();
+#else
     SPI.begin(variant::PIN_SPI_SCK, variant::PIN_SPI_MISO,
               variant::PIN_SPI_MOSI, variant::PIN_RADIO_CS);
+#endif
     const int16_t state = radio_.begin(variant::DEFAULT_FREQUENCY_MHZ,
                                        variant::DEFAULT_BANDWIDTH_KHZ,
                                        variant::DEFAULT_SPREADING_FACTOR,
@@ -45,10 +55,14 @@ class Sx1262Driver final : public Driver {
       LOG_ERR("SX1262 init failed: %d", state);
       return Result::HardwareError;
     }
-#if defined(AXLORA_VARIANT_STATION_G2)
+#if defined(AXLORA_VARIANT_STATION_G2) || defined(AXLORA_VARIANT_SENSECAP_SOLAR)
     int16_t configState = radio_.setCurrentLimit(variant::DEFAULT_CURRENT_LIMIT_MA);
     if (configState == RADIOLIB_ERR_NONE) {
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+      configState = radio_.setRxBoostedGainMode(true);
+#else
       configState = radio_.setRxBoostedGainMode(false);
+#endif
     }
     if (configState == RADIOLIB_ERR_NONE) {
       configState = radio_.setDio2AsRfSwitch(variant::USE_DIO2_RF_SWITCH);
@@ -64,7 +78,7 @@ class Sx1262Driver final : public Driver {
       radio_.setRfSwitchPins(radioLibPin(variant::PIN_RADIO_RXEN),
                              radioLibPin(variant::PIN_RADIO_TXEN));
     }
-#if defined(AXLORA_VARIANT_STATION_G2)
+#if defined(AXLORA_VARIANT_STATION_G2) || defined(AXLORA_VARIANT_SENSECAP_SOLAR)
     configState = radio_.setCRC(true);
     if (configState != RADIOLIB_ERR_NONE) {
       LOG_ERR("SX1262 CRC configuration failed: %d", configState);
@@ -74,7 +88,7 @@ class Sx1262Driver final : public Driver {
     radio_.setCRC(true);
 #endif
     radio_.setDio1Action(onDio1Interrupt);
-#if defined(AXLORA_VARIANT_STATION_G2)
+#if defined(AXLORA_VARIANT_STATION_G2) || defined(AXLORA_VARIANT_SENSECAP_SOLAR)
     configState = radio_.startReceive();
     if (configState != RADIOLIB_ERR_NONE) {
       LOG_ERR("SX1262 receive start failed: %d", configState);
@@ -100,7 +114,13 @@ class Sx1262Driver final : public Driver {
     const int16_t state = radio_.transmit(const_cast<uint8_t*>(data), len);
     setTxLed(false);
     rxFlag_ = false;          // clear any RX interrupt that fired during TX
-    radio_.startReceive();
+    const int16_t receiveState = radio_.startReceive();
+    if (state != RADIOLIB_ERR_NONE) {
+      LOG_ERR("SX1262 transmit failed: %d", state);
+    }
+    if (receiveState != RADIOLIB_ERR_NONE) {
+      LOG_ERR("SX1262 receive restart failed: %d", receiveState);
+    }
     if (state == RADIOLIB_ERR_NONE) {
       lastTxMs_      = now;
       lastAirTimeMs_ = estimateAirtimeMs(len);

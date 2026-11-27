@@ -12,8 +12,13 @@ class Preferences {
     PreferenceType type = PT_INVALID;
   };
   inline static std::map<std::string, Value> values;
+  inline static bool failBegin = false;
   std::string prefix;
-  bool begin(const char* name, bool) { prefix = std::string(name) + ":"; return true; }
+  bool begin(const char* name, bool) {
+    if (failBegin) return false;
+    prefix = std::string(name) + ":";
+    return true;
+  }
   void end() {}
   bool isKey(const char* key) const { return values.count(prefix + key) != 0; }
   PreferenceType getType(const char* key) const {

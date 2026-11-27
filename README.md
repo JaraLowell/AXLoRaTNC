@@ -19,7 +19,8 @@ Use the browser-based installer — no drivers or tools needed. Works in Chrome 
 | TTGO T-Beam | ESP32 | SX1276 | `tbeam` | ⚠ not tested |
 | LilyGo T3 LoRa32 V1.6.1 | ESP32 | SX1276 | `lilygo_t3_v161` | ✅ tested |
 | LILYGO T-Beam SUPREME 433MHz | ESP32-S3 | SX1262 | `tbeam_supreme_433` | ⚠ not tested |
-| BQ Station G2 | ESP32-S3 | SX1262 + PA | `station_g2` | ⚠ not tested |
+| BQ Station G2 | ESP32-S3 | SX1262 + PA | `station_g2` | ✅ tested |
+| Seeed SenseCAP Solar | nRF52840 | SX1262 | `sensecap_solar` | ⚠ experimental; hardware not tested |
 
 On OLED-equipped devices, the screen sleeps after 60 seconds without successful
 LoRa packet transmission or reception and wakes on the next radio activity.
@@ -48,6 +49,15 @@ for GPNG setup and USB/TCP ownership. Keep port 8100 on a trusted network:
 KISS TCP has no authentication and permits RF transmission.
 
 This is AXLoRaTNC's AX.25-over-LoRa KISS modem, not MeshCore's KISS modem or MeshCore packet protocol. Radio peers must use compatible AXLoRaTNC framing and radio settings.
+
+### SenseCAP Solar
+
+The experimental `sensecap_solar` build is a standalone AX.25 digipeater with
+a configurable manager welcome and an in-memory heard list. See the
+[relay setup](website/guide/aprs.md#sensecap-solar-relay) and
+[board notes](boards/README.md#seeed-sensecap-solar). Radio operation and
+battery shutdown/recovery have not been verified on hardware; do not rely on
+the battery protection for unattended use until tested.
 
 ## Build from source
 

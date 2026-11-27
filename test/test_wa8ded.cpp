@@ -4,6 +4,7 @@
 #include <iostream>
 #include "tnc/tnc.h"
 #include "tnc/ded_protocol.h"
+#include "variant/sensecap_solar_power.h"
 
 using namespace axlora;
 
@@ -29,8 +30,78 @@ struct TncTestAccess {
   static bool enqueue(Tnc& modem, uint8_t channel, uint8_t code, const uint8_t* data, size_t len) {
     return modem.enqueueDedEvent(channel, code, data, len);
   }
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  static void console(Tnc& modem, char* text) { modem.handleConsoleLine(text); }
+  static void relayResponses(Tnc& modem, uint8_t channel) { modem.serviceRelayResponses(channel); }
+  static void updateRelayUptime(Tnc& modem) { modem.updateRelayUptime(); }
+  static void input(Tnc& modem, uint8_t channel, const char* text) {
+    modem.processNodeInput(channel, reinterpret_cast<const uint8_t*>(text), strlen(text));
+  }
+  static void heard(Tnc& modem, const ax25::Frame& frame) { modem.observeHeard(frame, -90, 8); }
+  static bool repeat(Tnc& modem, const ax25::Frame& frame) { return modem.maybeDigipeat(frame); }
+  static bool popRaw(Tnc& modem, ax25::Frame& frame, bool priority = false) {
+    Tnc::PendingRawTx tx{};
+    auto& queue = priority ? modem.rawTxPriorityQueue_ : modem.rawTxQueue_;
+    return queue.pop(tx) && ax25::decodeFrame(tx.data, tx.len, frame, true);
+  }
+  static bool mheardPending(Tnc& modem, uint8_t channel) {
+    return modem.channels_[channel].relayMheardPending;
+  }
+  static const char* manager(Tnc& modem) { return modem.manager_; }
+  static ax25::LinkState state(Tnc& modem, uint8_t channel) {
+    return modem.channels_[channel].link.state();
+  }
+  static void connectedInput(Tnc& modem, uint8_t channel, uint8_t nr, const char* text) {
+    ax25::LinkLayer& link = modem.channels_[channel].link;
+    ax25::Frame frame{};
+    frame.source = link.peer();
+    frame.destination = link.local();
+    frame.command = true;
+    frame.control = ax25::makeI(0, nr, false);
+    frame.pid = ax25::PID_NO_LAYER3;
+    frame.infoLen = strlen(text);
+    assert(frame.infoLen <= sizeof(frame.info));
+    memcpy(frame.info, text, frame.infoLen);
+    uint8_t encoded[MAX_PACKET_BYTES]{};
+    size_t length = 0;
+    assert(ax25::encodeFrame(frame, encoded, sizeof(encoded), length, true));
+    link.receive(encoded, length);
+  }
+  static void acknowledge(Tnc& modem, uint8_t channel, uint8_t& next) {
+    ax25::LinkLayer& link = modem.channels_[channel].link;
+    const uint8_t count = link.outstandingFrameCount();
+    if (count == 0) return;
+    next = static_cast<uint8_t>((next + count) & 7);
+    ax25::Frame frame{};
+    frame.source = link.peer();
+    frame.destination = link.local();
+    frame.command = false;
+    frame.control = ax25::makeS(ax25::SFrameType::RR, next, false);
+    uint8_t encoded[MAX_PACKET_BYTES]{};
+    size_t length = 0;
+    assert(ax25::encodeFrame(frame, encoded, sizeof(encoded), length, true));
+    link.receive(encoded, length);
+  }
+  static bool relayDrained(Tnc& modem, uint8_t channel) {
+    const auto& cs = modem.channels_[channel];
+    return !cs.relayMheardPending && cs.link.connectedQueueSize() == 0 &&
+           cs.link.outstandingFrameCount() == 0;
+  }
+#endif
 };
 }
+
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+namespace axlora::variant {
+bool testBatteryAvailable = true;
+uint16_t testBatteryMillivolts = 3975;
+bool readBatteryMillivolts(uint16_t& millivolts) {
+  if (!testBatteryAvailable) return false;
+  millivolts = testBatteryMillivolts;
+  return true;
+}
+}
+#endif
 
 namespace axlora::util {
 bool logEnabled() { return false; }
@@ -41,13 +112,14 @@ namespace axlora::radio {
 class TestRadio : public Driver {
  public:
   std::deque<RxPacket> packets;
+  unsigned frequencyUpdates = 0;
   Result init() override { return Result::Ok; }
   Result send(const uint8_t*, size_t) override { return Result::Ok; }
   Result receive(RxPacket& packet) override {
     if (packets.empty()) return Result::NoPacket;
     packet = packets.front(); packets.pop_front(); return Result::Ok;
   }
-  Result setFrequency(float) override { return Result::Ok; }
+  Result setFrequency(float) override { ++frequencyUpdates; return Result::Ok; }
   Result setFrequencyCorrection(float) override { return Result::Ok; }
   Result setPower(int8_t) override { return Result::Ok; }
   Result setSpreadingFactor(uint8_t) override { return Result::Ok; }
@@ -347,6 +419,163 @@ void testReceiveBackpressure() {
   assert(ax25::addressEquals(link.local(), config.local));
 }
 
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+void testSolarRelay() {
+  testMillis = 0;
+  Preferences::values.clear();
+  Preferences::failBegin = true;
+  static tnc::Tnc unavailable;
+  unavailable.begin("N1DIG");
+  assert(!unavailable.settingsReady());
+  Preferences::failBegin = false;
+  static tnc::Tnc relay;
+  relay.begin("N1DIG");
+  assert(relay.settingsReady());
+  char manager[] = "manager Example Operator";
+  tnc::TncTestAccess::console(relay, manager);
+  assert(Preferences::values.at("axloratnc:manager").text == "Example Operator");
+  static tnc::Tnc reloaded;
+  reloaded.begin("N1DIG");
+  assert(strcmp(tnc::TncTestAccess::manager(reloaded), "Example Operator") == 0);
+  radio::testRadio.frequencyUpdates = 0;
+  relay.loop(true);
+  relay.loop(false);
+  relay.loop(true);
+  assert(radio::testRadio.frequencyUpdates == 2);
+
+  ax25::Frame frame{};
+  ax25::parseAddress("N1PEER", frame.source);
+  ax25::parseAddress("N1DEST", frame.destination);
+  ax25::parseAddress("N1DIG", frame.repeaters[0]);
+  frame.repeaterCount = 1;
+  frame.control = ax25::makeU(ax25::UFrameType::UI, false);
+  assert(tnc::TncTestAccess::repeat(relay, frame));
+  ax25::Frame repeated{};
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(repeated.repeaters[0].repeated);
+  frame.control = ax25::makeU(ax25::UFrameType::SABM, true);
+  assert(tnc::TncTestAccess::repeat(relay, frame));
+  assert(tnc::TncTestAccess::popRaw(relay, repeated, true));
+  assert(repeated.repeaters[0].repeated);
+  ax25::parseAddress("N2DIG", frame.repeaters[0]);
+  assert(!tnc::TncTestAccess::repeat(relay, frame));
+
+  frame.repeaterCount = 0;
+  ax25::parseAddress("N1DIG", frame.destination);
+  radio::RxPacket packet{};
+  assert(ax25::encodeFrame(frame, packet.data, sizeof(packet.data), packet.len, true));
+  radio::testRadio.packets.push_back(packet);
+  Serial.output.clear();
+  tnc::TncTestAccess::receive(relay);
+  assert(Serial.output.empty());
+  tnc::TncTestAccess::status(relay);
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen) ==
+         "This station is managed by Example Operator.\r");
+
+  tnc::TncTestAccess::input(relay, 0, "ignored\r//mHeArD\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen).find("callsign") == 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen).find("N1PEER") == 0);
+  assert(!tnc::TncTestAccess::mheardPending(relay, 0));
+  for (unsigned i = 0; i < 20; ++i) {
+    char call[8]{};
+    snprintf(call, sizeof(call), "N%uABC", i);
+    assert(ax25::parseAddress(call, frame.source));
+    tnc::TncTestAccess::heard(relay, frame);
+  }
+  tnc::TncTestAccess::input(relay, 0, "//MH\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::mheardPending(relay, 0));
+  uint8_t acknowledged = 0;
+  unsigned lines = 0;
+  for (unsigned attempt = 0; attempt < 40; ++attempt) {
+    tnc::TncTestAccess::acknowledge(relay, 0, acknowledged);
+    tnc::TncTestAccess::relayResponses(relay, 0);
+    while (tnc::TncTestAccess::popRaw(relay, repeated)) {
+      if (ax25::kind(repeated.control) == ax25::FrameKind::I) ++lines;
+    }
+    if (tnc::TncTestAccess::relayDrained(relay, 0)) break;
+  }
+  assert(tnc::TncTestAccess::relayDrained(relay, 0));
+  assert(lines == 21);
+
+  assert(variant::batteryPercentageFromMillivolts(3000) == 0);
+  assert(variant::batteryPercentageFromMillivolts(3750) == 50);
+  assert(variant::batteryPercentageFromMillivolts(4200) == 100);
+  assert(variant::batteryPercentageFromMillivolts(4500) == 100);
+
+  radio::stats().txOk = 8;
+  radio::stats().rxOk = 19;
+  testMillis = 61UL * 60000;
+  tnc::TncTestAccess::input(relay, 0, "//i\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen) ==
+         "Battery: 3.975 V (75%)  TX: 8  RX: 19  Uptime: 01 hour and 01 minute\r");
+  tnc::TncTestAccess::acknowledge(relay, 0, acknowledged);
+
+  variant::testBatteryAvailable = false;
+  testMillis = (23UL * 60 + 59) * 60000;
+  tnc::TncTestAccess::input(relay, 0, "//I\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen) ==
+         "Battery: unavailable  TX: 8  RX: 19  Uptime: 23 hours and 59 minutes\r");
+  tnc::TncTestAccess::acknowledge(relay, 0, acknowledged);
+
+  variant::testBatteryAvailable = true;
+  testMillis = 24UL * 60 * 60000;
+  tnc::TncTestAccess::input(relay, 0, "//I\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen) ==
+         "Battery: 3.975 V (75%)  TX: 8  RX: 19  Uptime: 1 day and 00 hours\r");
+  tnc::TncTestAccess::acknowledge(relay, 0, acknowledged);
+
+  testMillis = 25UL * 60 * 60000;
+  tnc::TncTestAccess::input(relay, 0, "//I\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen) ==
+         "Battery: 3.975 V (75%)  TX: 8  RX: 19  Uptime: 1 day and 01 hour\r");
+  tnc::TncTestAccess::acknowledge(relay, 0, acknowledged);
+
+  testMillis = 0xFFFFFF00;
+  tnc::TncTestAccess::updateRelayUptime(relay);
+  testMillis = 3600000UL - 256;
+  tnc::TncTestAccess::input(relay, 0, "//I\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(std::string(reinterpret_cast<const char*>(repeated.info), repeated.infoLen) ==
+         "Battery: 3.975 V (75%)  TX: 8  RX: 19  Uptime: 49 days and 18 hours\r");
+  tnc::TncTestAccess::acknowledge(relay, 0, acknowledged);
+
+  while (tnc::TncTestAccess::popRaw(relay, repeated, true)) {}
+  tnc::TncTestAccess::input(relay, 0, "//I\r");
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  ax25::parseAddress("N3UNIQ", frame.source);
+  ax25::parseAddress("N1DEST", frame.destination);
+  ax25::parseAddress("N1DIG", frame.repeaters[0]);
+  frame.repeaterCount = 1;
+  frame.control = ax25::makeU(ax25::UFrameType::UI, false);
+  assert(tnc::TncTestAccess::repeat(relay, frame));
+
+  tnc::TncTestAccess::connectedInput(relay, 0, acknowledged, "//q\r");
+  assert(tnc::TncTestAccess::state(relay, 0) == ax25::LinkState::Connected);
+  tnc::TncTestAccess::relayResponses(relay, 0);
+  assert(tnc::TncTestAccess::state(relay, 0) == ax25::LinkState::Disconnecting);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated, true));
+  assert(ax25::uType(repeated.control) == ax25::UFrameType::DISC);
+  assert(tnc::TncTestAccess::popRaw(relay, repeated));
+  assert(ax25::addressEquals(repeated.source, frame.source));
+  assert(!tnc::TncTestAccess::popRaw(relay, repeated));
+}
+#endif
+
 int main() {
   modem.begin("N1LOC");
   tnc::TncTestAccess::hostmode(modem);
@@ -355,5 +584,8 @@ int main() {
   testChannelsAndMaximumPayload();
   testIncomingConnectText();
   testReceiveBackpressure();
+#if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
+  testSolarRelay();
+#endif
   std::cout << "WA8DED command, monitor, polling and receive-backpressure tests passed\n";
 }
