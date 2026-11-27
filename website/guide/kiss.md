@@ -32,6 +32,25 @@ An actual reboot can transmit the boot beacon if beacons are enabled.
 - Received AX.25 frames are FCS-checked and emitted as KISS data frames without FCS — exactly as a standard KISS TNC.
 - KISS parameter frames (TxDelay=1, Persistence=2, SlotTime=3, FullDuplex=5) are accepted and drive the CSMA algorithm.
 
+### LoRa packet size
+
+LoRa carries at most 255 bytes per packet, including the AX.25 addresses,
+control, PID and FCS. With no digipeaters, an ordinary I or UI frame can
+carry at most 237 information bytes; each digipeater reduces that by 7.
+An escaped PID uses one more byte.
+
+If an outgoing I or UI frame exceeds that limit, the TNC replaces its entire
+information field with a text warning reporting the maximum information length,
+the original information length and the original packet length. The original
+addresses, control and PID are retained. The warning is sent instead of the
+original data, **not in addition to it**. In connected mode the warning can be
+acknowledged as if the original data were delivered; binary protocols may not
+display it as text. Oversized other frames are rejected. KISS has no standard
+error reply, so configure the host's PACLEN to prevent data loss.
+
+The KISS input buffer accepts at most 330 unescaped frame bytes, excluding the
+KISS command byte. Frames larger than that cannot be replaced with a warning.
+
 ## Station G2: Wi-Fi KISS TCP
 
 Station G2 builds include a raw KISS TCP server on **port 8100**, for use with

@@ -35,6 +35,12 @@ Payloads are 1-256 bytes, without a required terminating NUL.
 For example, the two-character command `@B` is `01 01 01 40 42`
 on channel 1. Flag 0 sends data; flag 1 sends a command.
 
+For radio transmission, a 256-byte host payload can exceed the LoRa packet
+limit once AX.25 headers and FCS are included. Oversized I or UI frames are
+sent with a warning instead of their original data; see
+[LoRa packet size](/guide/kiss#lora-packet-size). This does not affect local
+loopback, which does not use the radio.
+
 | Reply code | Meaning | Encoding after code |
 |---|---|---|
 | 0 | Success / nothing pending | None |

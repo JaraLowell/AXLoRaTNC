@@ -2,6 +2,7 @@
 #include "native/Preferences.h"
 #include <cassert>
 #include <iostream>
+#include "ax25/ax25_fcs.h"
 #include "tnc/tnc.h"
 #include "tnc/ded_protocol.h"
 #include "variant/sensecap_solar_power.h"
@@ -29,6 +30,17 @@ struct TncTestAccess {
   static void clearEvents(Tnc& modem) { modem.dedEvents_.clear(); }
   static bool enqueue(Tnc& modem, uint8_t channel, uint8_t code, const uint8_t* data, size_t len) {
     return modem.enqueueDedEvent(channel, code, data, len);
+  }
+  static void kiss(Tnc& modem, const ax25::KissFrame& frame) { modem.handleKiss(frame); }
+  static void enableTransmit(Tnc& modem) { modem.dedTxEnabled_ = true; }
+  static bool raw(Tnc& modem, const uint8_t* data, size_t len) {
+    return modem.enqueueRawTx(data, len, 0);
+  }
+  static bool popRawBytes(Tnc& modem, std::vector<uint8_t>& bytes) {
+    Tnc::PendingRawTx tx{};
+    if (!modem.rawTxQueue_.pop(tx)) return false;
+    bytes.assign(tx.data, tx.data + tx.len);
+    return true;
   }
 #if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
   static void console(Tnc& modem, char* text) { modem.handleConsoleLine(text); }
@@ -419,6 +431,83 @@ void testReceiveBackpressure() {
   assert(ax25::addressEquals(link.local(), config.local));
 }
 
+void testOversizedRadioFrames() {
+  static tnc::Tnc sender;
+  sender.begin("N1LOC");
+  tnc::TncTestAccess::enableTransmit(sender);
+  ax25::Frame frame{};
+  assert(ax25::parseAddress("N1LOC", frame.source));
+  assert(ax25::parseAddress("N1PEER", frame.destination));
+  frame.control = ax25::makeI(3, 5, true);
+  frame.infoLen = 237;
+  memset(frame.info, 'x', sizeof(frame.info));
+  ax25::KissFrame kiss{};
+  assert(ax25::encodeFrame(frame, kiss.data, sizeof(kiss.data), kiss.len, false));
+  std::vector<uint8_t> sent;
+  tnc::TncTestAccess::kiss(sender, kiss);
+  assert(tnc::TncTestAccess::popRawBytes(sender, sent));
+  assert(sent.size() == MAX_LORA_PACKET_BYTES);
+  assert(memcmp(sent.data(), kiss.data, kiss.len) == 0);
+  assert(ax25::checkFcs(sent.data(), sent.size()));
+
+  frame.repeaterCount = ax25::MAX_REPEATERS;
+  for (auto& repeater : frame.repeaters) assert(ax25::parseAddress("N1DIG", repeater));
+  frame.infoLen = 196;
+  assert(ax25::encodeFrame(frame, kiss.data, sizeof(kiss.data), kiss.len, false));
+  tnc::TncTestAccess::kiss(sender, kiss);
+  assert(tnc::TncTestAccess::popRawBytes(sender, sent));
+  assert(sent.size() <= MAX_LORA_PACKET_BYTES);
+  assert(memcmp(sent.data(), kiss.data, 58) == 0);
+  ax25::Frame decoded{};
+  assert(ax25::decodeFrame(sent.data(), sent.size(), decoded, true));
+  assert(decoded.control == frame.control);
+  assert(std::string(reinterpret_cast<const char*>(decoded.info), decoded.infoLen) ==
+         "\rAXLoRa: payload too large. Max payload 195 bytes, payload 196 bytes "
+         "(packet 256 bytes, max 255).\r");
+
+  uint8_t raw[MAX_PACKET_BYTES]{};
+  size_t rawLen = 0;
+  assert(ax25::encodeFrame(frame, raw, sizeof(raw), rawLen, true));
+  assert(tnc::TncTestAccess::raw(sender, raw, rawLen));
+  assert(tnc::TncTestAccess::popRawBytes(sender, sent));
+  assert(ax25::decodeFrame(sent.data(), sent.size(), decoded, true));
+  assert(decoded.control == frame.control && decoded.repeaterCount == frame.repeaterCount);
+  raw[rawLen - 1] ^= 1;
+  assert(!tnc::TncTestAccess::raw(sender, raw, rawLen));
+
+  frame.control = ax25::makeU(ax25::UFrameType::UI, false);
+  frame.repeaterCount = 0;
+  frame.infoLen = 237;
+  assert(ax25::encodeFrame(frame, kiss.data, sizeof(kiss.data), kiss.len, false));
+  memmove(kiss.data + 17, kiss.data + 16, frame.infoLen);
+  kiss.data[15] = ax25::PID_ESCAPE;
+  kiss.data[16] = ax25::PID_NO_LAYER3;
+  ++kiss.len;
+  tnc::TncTestAccess::kiss(sender, kiss);
+  assert(tnc::TncTestAccess::popRawBytes(sender, sent));
+  assert(memcmp(sent.data(), kiss.data, 17) == 0);
+  assert(ax25::decodeFrame(sent.data(), sent.size(), decoded, true));
+  assert(std::string(reinterpret_cast<const char*>(decoded.info), decoded.infoLen) ==
+         "\rAXLoRa: payload too large. Max payload 236 bytes, payload 237 bytes "
+         "(packet 256 bytes, max 255).\r");
+
+  frame.infoLen = 256;
+  assert(ax25::encodeFrame(frame, kiss.data, sizeof(kiss.data), kiss.len, false));
+  memset(kiss.data + kiss.len, 'z', sizeof(kiss.data) - kiss.len);
+  kiss.len = sizeof(kiss.data);
+  tnc::TncTestAccess::kiss(sender, kiss);
+  assert(tnc::TncTestAccess::popRawBytes(sender, sent));
+  assert(ax25::decodeFrame(sent.data(), sent.size(), decoded, true));
+  assert(std::string(reinterpret_cast<const char*>(decoded.info), decoded.infoLen) ==
+         "\rAXLoRa: payload too large. Max payload 237 bytes, payload 314 bytes "
+         "(packet 332 bytes, max 255).\r");
+
+  frame.control = ax25::makeU(ax25::UFrameType::TEST, false);
+  assert(ax25::encodeFrame(frame, raw, sizeof(raw), rawLen, true));
+  assert(!tnc::TncTestAccess::raw(sender, raw, rawLen));
+  assert(!tnc::TncTestAccess::popRawBytes(sender, sent));
+}
+
 #if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
 void testSolarRelay() {
   testMillis = 0;
@@ -584,6 +673,7 @@ int main() {
   testChannelsAndMaximumPayload();
   testIncomingConnectText();
   testReceiveBackpressure();
+  testOversizedRadioFrames();
 #if defined(AXLORA_VARIANT_SENSECAP_SOLAR)
   testSolarRelay();
 #endif

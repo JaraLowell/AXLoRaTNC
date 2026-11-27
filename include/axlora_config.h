@@ -13,5 +13,6 @@
 namespace axlora {
 
 static constexpr uint16_t MAX_PACKET_BYTES = 330;
+static constexpr uint16_t MAX_LORA_PACKET_BYTES = 255;
 
 }

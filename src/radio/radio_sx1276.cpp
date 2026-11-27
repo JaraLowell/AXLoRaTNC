@@ -57,7 +57,7 @@ class Sx1276Driver final : public Driver {
     if (data == nullptr || len == 0) {
       return Result::Invalid;
     }
-    if (len > MAX_PACKET_BYTES) {
+    if (len > MAX_LORA_PACKET_BYTES) {
       return Result::TooLarge;
     }
     const uint32_t now = util::nowMs();

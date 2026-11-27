@@ -116,6 +116,44 @@ bool isUiFrame(const ax25::Frame& frame) {
          ax25::uType(frame.control) == ax25::UFrameType::UI;
 }
 
+static bool oversizedDataWarning(const uint8_t* data, size_t len, uint8_t* out, size_t& outLen) {
+  if (!ax25::checkFcs(data, len)) return false;
+  const size_t frameLen = len - 2;
+  size_t offset = 0;
+  bool last = false;
+  for (uint8_t i = 0; i < ax25::MAX_ADDRS; ++i) {
+    if (offset + 7 > frameLen) return false;
+    ax25::Address address{};
+    if (!ax25::decodeAddress(data + offset, address, last) || (i == 0 && last)) return false;
+    offset += 7;
+    if (last) break;
+  }
+  if (!last || offset >= frameLen) return false;
+  const uint8_t control = data[offset++];
+  if (ax25::kind(control) != ax25::FrameKind::I &&
+      !(ax25::kind(control) == ax25::FrameKind::U &&
+        ax25::uType(control) == ax25::UFrameType::UI)) return false;
+  if (offset >= frameLen) return false;
+  if (data[offset++] == ax25::PID_ESCAPE) {
+    if (offset >= frameLen) return false;
+    ++offset;
+  }
+  const size_t maxPayload = MAX_LORA_PACKET_BYTES - offset - 2;
+  const size_t payloadLen = frameLen - offset;
+  char warning[128]{};
+  const int warningLen = snprintf(warning, sizeof(warning),
+      "\rAXLoRa: payload too large. Max payload %u bytes, payload %u bytes "
+      "(packet %u bytes, max %u).\r",
+      static_cast<unsigned>(maxPayload), static_cast<unsigned>(payloadLen),
+      static_cast<unsigned>(len), static_cast<unsigned>(MAX_LORA_PACKET_BYTES));
+  if (warningLen < 0 || static_cast<size_t>(warningLen) >= sizeof(warning) ||
+      static_cast<size_t>(warningLen) > maxPayload) return false;
+  memcpy(out, data, offset);
+  memcpy(out + offset, warning, static_cast<size_t>(warningLen));
+  return ax25::appendFcs(out, offset + static_cast<size_t>(warningLen),
+                         out, MAX_LORA_PACKET_BYTES, outLen);
+}
+
 static const char* skipSpaces(const char* s) {
   while (s != nullptr && *s == ' ') ++s;
   return s;
@@ -350,18 +388,28 @@ void Tnc::serviceLoopbackTx() {
 }
 
 bool Tnc::enqueueRawTx(const uint8_t* data, size_t len, uint32_t delayMs, uint8_t chIdx) {
-  if (data == nullptr || len == 0 || len > MAX_PACKET_BYTES) {
+  if (data == nullptr || len == 0 || len > MAX_PACKET_BYTES + 2) {
     ++rawTxQueueDrops_;
+    LOG_WARN("invalid radio tx length=%u", static_cast<unsigned>(len));
     return false;
   }
 
   PendingRawTx tx{};
-  memcpy(tx.data, data, len);
-  tx.len = len;
+  if (len > MAX_LORA_PACKET_BYTES) {
+    if (!oversizedDataWarning(data, len, tx.data, tx.len)) {
+      ++rawTxQueueDrops_;
+      LOG_WARN("cannot replace oversized radio frame len=%u", static_cast<unsigned>(len));
+      return false;
+    }
+    LOG_WARN("replaced oversized radio payload, frame len=%u", static_cast<unsigned>(len));
+  } else {
+    memcpy(tx.data, data, len);
+    tx.len = len;
+  }
   tx.notBeforeMs = axlora::util::nowMs() + delayMs;
   tx.chIdx = chIdx;
   tx.id = rawTxNextId_++;
-  tx.priority = rawFramePriority(data, len);
+  tx.priority = rawFramePriority(tx.data, tx.len);
 
   RawTxQueue& queue = tx.priority ? rawTxPriorityQueue_ : rawTxQueue_;
   if (!queue.push(tx)) {
@@ -870,10 +918,12 @@ void Tnc::handleKiss(const ax25::KissFrame& frame, bool fromTcp) {
       ++kissDecodeErrors_;
       LINFBB_TRACE("KISS_AX25_IN_DECODE_FAIL len=%u", static_cast<unsigned>(frame.len));
     }
-    uint8_t withFcs[MAX_PACKET_BYTES]{};
+    uint8_t withFcs[MAX_PACKET_BYTES + 2]{};
     size_t len = 0;
     if (ax25::appendFcs(frame.data, frame.len, withFcs, sizeof(withFcs), len)) {
-      transmitRaw(withFcs, len);
+      if (!transmitRaw(withFcs, len)) {
+        LOG_WARN("KISS frame could not be queued for radio");
+      }
     } else {
       ++kissDecodeErrors_;
     }
