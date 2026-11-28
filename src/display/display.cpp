@@ -253,7 +253,11 @@ void init() {
   // Power on OLED via Vext switch if the variant has one.
   if constexpr (variant::PIN_OLED_VEXT >= 0) {
     pinMode(variant::PIN_OLED_VEXT, OUTPUT);
-    digitalWrite(variant::PIN_OLED_VEXT, HIGH);
+#if defined(AXLORA_VARIANT_HTIT_WB32LAF)
+    digitalWrite(variant::PIN_OLED_VEXT, LOW);   // HTIT-WB32LAF / V3.2
+#else
+    digitalWrite(variant::PIN_OLED_VEXT, HIGH);  // Heltec V3
+#endif
     delay(50);
   }
   Wire.begin(variant::PIN_OLED_SDA, variant::PIN_OLED_SCL);
